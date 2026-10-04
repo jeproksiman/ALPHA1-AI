@@ -40,3 +40,11 @@ config/api_keys.json
 credentials.json
 secrets.json
 config/certs/*.key
+
+# Private runtime memory (including SQLite journals)
+memory/*.db
+memory/*.db-*
+memory/*.sqlite*
+memory/long_term.json
+memory/last_session.json
+.pytest_cache/

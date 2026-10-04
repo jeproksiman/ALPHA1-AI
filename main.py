@@ -82,6 +82,9 @@ from core                      import confirm as confirm_gate
 from core                      import audio_devices
 from core.action_loader        import discover_actions
 from core.echo                 import EchoGuard
+from core.offline_brain        import OfflineBrain
+from core.brain.app_commands   import configure_app_commands
+from memory.config_manager    import get_offline_brain_settings
 from core.viseme               import VisemeStream
 from core.wake_word            import (
     WakeWordDetector, is_ready as wake_is_ready, install_and_download as wake_install,
@@ -587,6 +590,7 @@ class JarvisLive:
         self.ui.on_push_to_talk   = self.set_push_to_talk
         self.ui.ptt_hold          = self._on_ptt
         self.ui.on_text_command   = self._on_text_command
+        self.ui.on_offline_text_command = self._on_offline_text_command
         self.ui.on_remote_clicked = self._make_remote_key
         self.ui.on_interrupt      = self.interrupt
         self.ui.on_voice_change   = self._on_voice_change     # voice picker → rebuild session
@@ -648,6 +652,23 @@ class JarvisLive:
         self.ui.get_plugins = self._plugin_registry.list_for_ui
         self.ui.get_plugin_settings = self._plugin_registry.settings_schemas  # ⚙ settings tab
         self.ui.request_say = self.plugin_say   # plugins: mid-task speech channel
+
+        self._offline_brain = None
+        if get_offline_brain_settings()['enabled']:
+            try:
+                from actions.open_app import _APP_ALIASES
+                self._offline_brain = OfflineBrain()
+                configure_app_commands(
+                    self._offline_brain, self._action_registry, _APP_ALIASES,
+                    player=self.ui,
+                    confirmer=lambda intent, title, run: confirm_gate.request(
+                        'alpha_' + intent, title, 'Confirm this locally matched action.', run),
+                )
+                # Availability check runs off the UI thread and never launches Ollama.
+                threading.Thread(target=self._report_offline_brain, daemon=True).start()
+            except Exception:
+                print('[ALPHA BRAIN] Initialization unavailable; existing assistant remains active')
+                self._offline_brain = None
 
         # ── Wake word ────────────────────────────────────────────────────────
         # _awake gates the mic (see _listen_audio) and the background speakers.
@@ -852,12 +873,31 @@ class JarvisLive:
         manual = self._dashboard.get_manual_url()
         return url, key, f"{url}/auto-login?key={key}", manual
 
-    def _on_text_command(self, text: str):
-        if not self._loop or not self.session:
-            return
+    def _on_offline_text_command(self, text: str):
         # Respect wake-word sleep: a typed command must not be answered while
         # asleep either (the sleep gate is not just for the mic). Wake first with
         # "Hey Jarvis" or the WAKE NOW button.
+        if self._wake_enabled and not self._awake:
+            self.ui.write_log("SYS: I'm asleep — say 'Hey Jarvis' or tap WAKE NOW first.")
+            return
+        # Explicit escape preserves existing live tool/plugin handling during migration.
+        use_live = text.casefold().startswith('live:')
+        if use_live:
+            text = text[5:].strip()
+        if self._offline_brain is not None and not use_live:
+            try:
+                # UI submits this callback on a worker thread. No network/SQLite
+                # work blocks Qt, and no live cloud session is needed for local commands.
+                result = self._offline_brain.process(text)
+                self.ui.write_log('ALPHA: ' + result['text'])
+            except Exception:
+                self.ui.write_log('SYS: Offline brain could not complete this request.')
+            return
+        self._on_text_command(text)
+
+    def _on_text_command(self, text: str):
+        if not self._loop or not self.session:
+            return
         if self._wake_enabled and not self._awake:
             self.ui.write_log("SYS: I'm asleep — say 'Hey Jarvis' or tap WAKE NOW first.")
             return
@@ -868,6 +908,10 @@ class JarvisLive:
             ),
             self._loop
         )
+
+    def _report_offline_brain(self):
+        for line in self._offline_brain.startup_report():
+            print(line)
 
     def _tail_active(self) -> bool:
         """True while the speakers may still be finishing our last sentence."""
@@ -2443,8 +2487,8 @@ def main():
     ui = JarvisUI("face.png")
 
     def runner():
-        ui.wait_for_api_key()
         jarvis = JarvisLive(ui)
+        ui.wait_for_api_key()
         try:
             asyncio.run(jarvis.run())
         except KeyboardInterrupt:

@@ -5596,8 +5596,9 @@ class MainWindow(QMainWindow):
         if not txt: return
         self._input.clear()
         self._log.append_log(f"You: {txt}")
-        if self.on_text_command:
-            threading.Thread(target=self.on_text_command, args=(txt,), daemon=True).start()
+        callback = getattr(self, 'on_offline_text_command', None) or self.on_text_command
+        if callback:
+            threading.Thread(target=callback, args=(txt,), daemon=True).start()
 
     def _apply_state(self, state: str):
         self.hud.state    = state
@@ -5684,6 +5685,14 @@ class JarvisUI:
     @on_text_command.setter
     def on_text_command(self, cb):
         self._win.on_text_command = cb
+
+    @property
+    def on_offline_text_command(self):
+        return getattr(self._win, 'on_offline_text_command', None)
+
+    @on_offline_text_command.setter
+    def on_offline_text_command(self, cb):
+        self._win.on_offline_text_command = cb
 
     @property
     def on_remote_clicked(self):
