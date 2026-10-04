@@ -13,6 +13,18 @@ CONFIG_DIR  = BASE_DIR / "config"
 CONFIG_FILE = CONFIG_DIR / "api_keys.json"
 
 
+def get_runtime_settings() -> dict:
+    cfg = load_api_keys()
+    def value(name, default):
+        return os.environ.get(name, cfg.get(name.lower(), default))
+    mode = str(value('ALPHA_RUNTIME_MODE', 'auto')).strip().lower()
+    return {
+        'mode': mode if mode in ('auto', 'offline', 'live') else 'auto',
+        'vosk_model_path': str(value('ALPHA_OFFLINE_STT_MODEL_PATH', '')).strip(),
+        'tts_enabled': str(value('ALPHA_OFFLINE_TTS', 'false')).lower() in ('true', '1', 'yes', 'on'),
+    }
+
+
 def get_offline_brain_settings() -> dict:
     """Environment overrides the existing local config; never writes credentials."""
     cfg = load_api_keys()

@@ -84,7 +84,9 @@ from core.action_loader        import discover_actions
 from core.echo                 import EchoGuard
 from core.offline_brain        import OfflineBrain
 from core.brain.app_commands   import configure_app_commands
-from memory.config_manager    import get_offline_brain_settings
+from memory.config_manager    import get_offline_brain_settings, get_runtime_settings, load_api_keys
+from core.runtime_mode        import RuntimeMode, error_kind
+from core.offline_voice       import OfflineVoice
 from core.viseme               import VisemeStream
 from core.wake_word            import (
     WakeWordDetector, is_ready as wake_is_ready, install_and_download as wake_install,
@@ -296,16 +298,14 @@ def _render_prompt(template: str, values: dict) -> str:
 
 
 def _get_ai_provider() -> str:
-    with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
-        provider = json.load(f).get("ai_provider", "gemini")
+    provider = load_api_keys().get("ai_provider", "gemini")
     return provider if provider in ("gemini", "deepgram") else "gemini"
 
 
 def _get_api_key(provider: str | None = None) -> str:
     provider = provider or _get_ai_provider()
     field = "deepgram_api_key" if provider == "deepgram" else "gemini_api_key"
-    with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)[field]
+    return load_api_keys().get(field, '')
 
 
 def _load_system_prompt() -> str:
@@ -550,6 +550,10 @@ def _keep_context_of(exc: BaseException) -> bool:
 
 class JarvisLive:
     def __init__(self, ui: JarvisUI):
+        self._runtime = RuntimeMode(get_runtime_settings)
+        self._local_busy = 0
+        self._local_lock = threading.Lock()
+        self._offline_voice = None
         self.ui             = ui
         self._asst_name     = "JARVI    S"   # updated each session from config
         self.session              = None
@@ -884,18 +888,35 @@ class JarvisLive:
         use_live = text.casefold().startswith('live:')
         if use_live:
             text = text[5:].strip()
+        offline = getattr(getattr(self, '_runtime', None), 'offline', False)
+        if offline:
+            use_live = False
         if self._offline_brain is not None and not use_live:
+            lock = getattr(self, '_local_lock', None)
+            if lock:
+                with lock:
+                    self._local_busy += 1
             try:
                 # UI submits this callback on a worker thread. No network/SQLite
                 # work blocks Qt, and no live cloud session is needed for local commands.
                 result = self._offline_brain.process(text)
                 self.ui.write_log('ALPHA: ' + result['text'])
+                return result['text']
             except Exception:
                 self.ui.write_log('SYS: Offline brain could not complete this request.')
+            finally:
+                if lock:
+                    with lock:
+                        self._local_busy -= 1
+            return
+        if offline:
+            self.ui.write_log('SYS: Offline brain unavailable; enable ALPHA_OFFLINE_BRAIN_ENABLED.')
             return
         self._on_text_command(text)
 
     def _on_text_command(self, text: str):
+        if self._runtime.offline:
+            return self._on_offline_text_command(text)
         if not self._loop or not self.session:
             return
         if self._wake_enabled and not self._awake:
@@ -982,6 +1003,8 @@ class JarvisLive:
     def interrupt(self) -> None:
         """Stop JARVIS mid-speech: drain queued audio and open mic immediately."""
         self._interrupted = True
+        if self._offline_voice:
+            self._offline_voice.interrupt()
         q = self.audio_in_queue
         if q:
             drained = 0
@@ -1746,8 +1769,6 @@ class JarvisLive:
                         )
                         await self._flush_pending_vision()
         except Exception as e:
-            print(f"[JARVIS] ❌ Recv: {e}")
-            traceback.print_exc()
             raise
 
     async def _play_audio(self):
@@ -2207,6 +2228,60 @@ class JarvisLive:
 
     # ── main loop ───────────────────────────────────────────────────────────
 
+    async def _await_live_admission(self):
+        """The sole runtime gate; typed callbacks stay independent of this wait."""
+        announced = False
+        try:
+            while True:
+                provider = _get_ai_provider()
+                with self._local_lock:
+                    idle = self._local_busy == 0 and not self._is_speaking
+                idle = idle and not (self._offline_voice and self._offline_voice.active)
+                if await self._runtime.ready(provider, _get_api_key(provider), idle):
+                    # A local turn may have started during the bounded probe.
+                    # Recheck before stopping its microphone/TTS worker.
+                    with self._local_lock:
+                        idle = self._local_busy == 0 and not self._is_speaking
+                    idle = idle and not (self._offline_voice and self._offline_voice.active)
+                    if self._runtime.mode == 'auto' and announced and not idle:
+                        self._runtime.offline = True
+                        await asyncio.sleep(1)
+                        continue
+                    if announced:
+                        self.ui.write_log('SYS: Internet restored or live mode selected; connecting live voice.')
+                    return
+                if not announced:
+                    self.set_speaking(False)
+                    self.ui.set_state('OFFLINE')
+                    self._awake = True  # typed input remains usable without cloud wake audio
+                    message = 'SYS: ALPHA Offline Mode active. ' + self._runtime.reason
+                    print('[JARVIS] Offline services ready. ' + self._runtime.reason)
+                    self.ui.write_log(message)
+                    self._offline_voice = OfflineVoice(
+                        get_runtime_settings(), self._on_offline_text_command,
+                        lambda: not self.ui.muted and not self._is_speaking and not self._tail_active() and (
+                            not self._ptt_enabled or self._ptt_held),
+                        self.set_speaking, self.ui.write_log,
+                        device=audio_devices.resolve(get_input_device(), 'input'))
+                    self._offline_voice.start()
+                    announced = True
+                await asyncio.sleep(1)
+        finally:
+            if self._offline_voice:
+                await asyncio.to_thread(self._offline_voice.close)
+                self._offline_voice = None
+
+    async def _watch_runtime_mode(self):
+        checked = time.monotonic()
+        while True:
+            await asyncio.sleep(1)
+            if self._runtime.mode == 'offline':
+                raise _ReconnectSignal()
+            if self._runtime.mode == 'auto' and time.monotonic() - checked >= 45:
+                checked = time.monotonic()
+                if not await self._runtime.probe(self._active_provider):
+                    raise ConnectionError('Internet/live provider unavailable')
+
     async def run(self):
         self._loop = asyncio.get_event_loop()
         self._reconnect_event = asyncio.Event()
@@ -2244,6 +2319,7 @@ class JarvisLive:
             self._dashboard = None
 
         while True:
+            await self._await_live_admission()
             provider = self._active_provider
             live_model = ""
             _resumed_with = False
@@ -2313,6 +2389,7 @@ class JarvisLive:
 
                     self._reconnect_event.clear()  # ignore requests from before this session
                     tg.create_task(self._watch_reconnect())
+                    tg.create_task(self._watch_runtime_mode())
                     tg.create_task(self._send_realtime())
                     tg.create_task(self._listen_audio())
                     tg.create_task(self._receive_audio())
@@ -2334,6 +2411,8 @@ class JarvisLive:
             except KeyboardInterrupt:
                 raise
             except SystemExit:
+                raise
+            except asyncio.CancelledError:
                 raise
             except BaseException as e:
                 # Catches both Exception and BaseExceptionGroup (Python 3.11+
@@ -2368,6 +2447,13 @@ class JarvisLive:
                     self.ui.write_log("SYS: Could not restore the conversation — starting fresh.")
                     self._resume_handle = None
                     self._conn_backoff = 0
+                    continue
+
+                kind = error_kind(e)
+                if self._runtime.mode == 'auto' and kind in ('network', 'auth'):
+                    self._runtime.failed(kind, _get_api_key(provider))
+                    self._resume_handle = None
+                    self.set_speaking(False)
                     continue
 
                 err_str = str(e)
@@ -2454,7 +2540,7 @@ class JarvisLive:
                     continue
 
                 # Network / timeout errors — log clearly and back off
-                is_net_err = any(k in err_str for k in (
+                is_net_err = kind == 'network' or any(k in err_str for k in (
                     "TimeoutError", "timed out", "getaddrinfo", "CancelledError",
                     "ConnectionRefusedError", "OSError", "Cannot connect",
                 ))
@@ -2463,14 +2549,14 @@ class JarvisLive:
                     self._conn_backoff = _conn_backoff
                     self.ui.write_log(
                         f"NET: Connection failed — retrying in {_conn_backoff}s. "
-                        "(a VPN may be required)"
+                        "Internet/live provider unavailable."
                     )
                 else:
                     self._conn_backoff = 3
             finally:
                 self.session = None
                 # Only save if there was a real conversation (≥3 turns)
-                if len(self._session_log) >= 3:
+                if not self._runtime.offline and len(self._session_log) >= 3:
                     asyncio.create_task(self._save_session_summary())
 
             self.set_speaking(False)
@@ -2488,7 +2574,8 @@ def main():
 
     def runner():
         jarvis = JarvisLive(ui)
-        ui.wait_for_api_key()
+        if get_runtime_settings()['mode'] == 'live':
+            ui.wait_for_api_key()
         try:
             asyncio.run(jarvis.run())
         except KeyboardInterrupt:

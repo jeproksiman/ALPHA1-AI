@@ -3297,7 +3297,8 @@ class MainWindow(QMainWindow):
 
         self._overlay: SetupOverlay | None = None
         self._ready = self._check_config()
-        if not self._ready:
+        from memory.config_manager import get_runtime_settings
+        if not self._ready and get_runtime_settings()['mode'] == 'live':
             self._show_setup()
 
         sc_mute = QShortcut(QKeySequence("F4"), self)
