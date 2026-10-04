@@ -30,21 +30,22 @@ class BrainTests(unittest.TestCase):
 
     def test_initialization_and_persistence(self):
         tables = {r[0] for r in self.memory.db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        self.assertEqual(tables, {'learned_knowledge', 'aliases', 'corrections', 'interaction_history'})
-        self.memory.store_solution('question', 'A persistent local answer.', confidence=0.9)
+        self.assertEqual(tables, {'learned_knowledge', 'aliases', 'corrections', 'interaction_history',
+                                  'confidence_events','knowledge_conflicts','routines','routine_steps'})
+        self.memory.store_solution('question', 'A persistent local answer.', source='user',confidence=0.9)
         other = AlphaMemory(self.path)
         self.assertEqual(other.search('QUESTION!')['response'], 'A persistent local answer.')
         other.close()
 
     def test_memory_before_provider(self):
-        item = self.memory.store_solution('what is sqlite', 'SQLite is a local relational database.', confidence=0.95)
+        item = self.memory.store_solution('what is sqlite', 'SQLite is a local relational database.', source='user',confidence=0.95)
         result = self.brain.process('What is SQLite?')
         self.assertEqual(result['source'], 'memory')
         self.assertEqual(result['knowledge_id'], item)
         self.provider.generate.assert_not_called()
 
     def test_alias_and_fuzzy(self):
-        self.memory.store_solution('explain local database storage', 'Local storage stays on this computer.', confidence=1)
+        self.memory.store_solution('explain local database storage', 'Local storage stays on this computer.', source='user',confidence=1)
         self.memory.add_alias('describe storage', 'explain local database storage')
         self.assertEqual(self.brain.process('describe storage')['source'], 'memory')
         match = self.memory.search('explain local database storages')
@@ -59,10 +60,11 @@ class BrainTests(unittest.TestCase):
         learner.record_success(item)
         duplicate = learner.learn_from_solution('HOW DOES SQLITE WORK?', 'A conflicting replacement answer.')
         self.assertEqual(item, duplicate)
-        self.assertAlmostEqual(self.memory.search('how does sqlite work')['confidence'], 0.9)
+        self.assertAlmostEqual(self.memory.search('how does sqlite work')['confidence'], 1.0)
         self.assertEqual(self.memory.search('how does sqlite work')['success_count'], 2)
         learner.record_failure(item)
-        self.assertLess(self.memory.search('how does sqlite work')['confidence'], 0.8)
+        self.assertEqual(self.memory.search('how does sqlite work')['verification_status'], 'candidate')
+        self.assertIsNone(self.memory.search('how does sqlite work',eligible_only=True))
 
     def test_low_confidence_falls_back(self):
         self.memory.store_solution('question', 'This unverified answer is only a candidate.', confidence=0.60)
@@ -100,7 +102,7 @@ class BrainTests(unittest.TestCase):
     def test_no_execution_from_learned_text(self):
         handler = Mock()
         self.brain.register_command('do action', handler)
-        self.memory.store_solution('explain an action', 'do action', confidence=1)
+        self.memory.store_solution('explain an action', 'do action', source='user',confidence=1)
         result = self.brain.process('explain an action')
         self.assertEqual(result['text'], 'do action')
         handler.assert_not_called()

@@ -5,7 +5,10 @@ _SECRET = re.compile(
     r"(?:AKIA|ASIA)[A-Z0-9]{16}|sk-[\w-]{16,}|"
     r"-----BEGIN [\w ]*PRIVATE KEY-----|"
     r"\b(?:api[_ -]?key|password|passwd|token|secret|authorization|"
-    r"client[_ -]?secret|private[_ -]?key)\b\s*[\"']?\s*[:=]|"
+    r"client[_ -]?secret|private[_ -]?key|credentials?|cookies?|"
+    r"session[_ -]?(?:id|cookie)|authentication[_ -]?cookies?|auth[_ -]?cookies?|"
+    r"(?:access|refresh|auth|id)[_ -]?token|secret[_ -]?key|api[_ -]?token|access[_ -]?key)\b\s*[\"']?\s*[:=]|"
+    r"\b(?:my\s+)?(?:password|api[_ -]?key|token|private[_ -]?key|credentials?)\s+is\s+\S+|"
     r"\bBearer\s+\S+|eyJ[\w-]+\.[\w-]+\.[\w-]+", re.I)
 _DANGEROUS = re.compile(
     r"\b(?:remove-item|del|erase|rmdir|rm|format|format-volume|diskpart|"

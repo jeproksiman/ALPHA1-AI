@@ -42,7 +42,9 @@ class OllamaProvider:
         if not model:
             return {'ok': False, 'text': 'No installed Ollama model. Configure ALPHA_OLLAMA_MODEL after installing a model.'}
         if model not in status['models'] and model + ':latest' not in status['models']:
-            return {'ok': False, 'text': 'Configured Ollama model is not installed. Set ALPHA_OLLAMA_MODEL to an installed model.'}
+            available = ', '.join(name for name in status['models'] if len(name)<=100) or 'none'
+            return {'ok': False, 'text': 'Configured Ollama model is not installed. Available models: '
+                    + available + '. Set ALPHA_OLLAMA_MODEL explicitly.'}
         try:
             response = self.session.post(self.url + '/api/chat',
                 json={'model': model, 'messages': messages, 'stream': False, 'options': {'num_predict': 600}},
@@ -59,8 +61,11 @@ class OllamaProvider:
 
     def generate(self, text, context=None):
         messages = [{'role': 'system', 'content':
-            'You are ALPHA, a local assistant. Give a concise text answer. '
-            'You cannot execute tools or claim to have performed actions.'}]
+            'You are ALPHA\'s local teacher and reasoning fallback. ALPHA already '
+            'handles registered local actions and verified knowledge. Answer only the '
+            'unresolved question with a concise, reusable text solution. Do not claim '
+            'that actions were executed. You cannot execute tools. Do not request or '
+            'repeat passwords, tokens, private keys, or authentication cookies.'}]
         # Only explicit text context is sent, never arbitrary application state/config.
         if context and isinstance(context.get('summary'), str):
             messages.append({'role': 'system', 'content': context['summary'][:2000]})
