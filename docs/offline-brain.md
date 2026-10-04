@@ -61,12 +61,19 @@ automatically. Set environment variables or the existing JSON settings explicitl
 | ALPHA_OFFLINE_BRAIN_ENABLED | true |
 | ALPHA_OLLAMA_ENABLED | true |
 | ALPHA_OLLAMA_URL | http://127.0.0.1:11434 |
-| ALPHA_OLLAMA_MODEL | empty: detect installed models |
+| ALPHA_OLLAMA_MODEL | gemma4:e4b |
+| ALPHA_OLLAMA_FAST_MODEL | qwen3.5:0.8b |
+| ALPHA_SEMANTIC_MEMORY | true |
+| ALPHA_EMBEDDING_PROVIDER | ollama |
+| ALPHA_EMBEDDING_MODEL | nomic-embed-text:latest |
 | ALPHA_LOCAL_CONFIDENCE_THRESHOLD | 0.80 (supported range 0.80–1.00) |
 | ALPHA_AUTO_LEARN_OLLAMA | false |
 
-Legacy `llm_url`/`llm_model` are reused when `llm_provider` is Ollama. An
-OpenAI-compatible backend's settings do not redirect this fallback.
+The offline brain now uses its explicit `ALPHA_*` settings and the role defaults
+above. Legacy `llm_url`/`llm_model` settings still belong to the existing helper
+client and do not override these roles. An OpenAI-compatible backend's settings
+do not redirect this fallback. The example environment file documents values;
+defaults already activate the requested local models without loading `.env`.
 
 ## Memory and learning
 
@@ -258,10 +265,94 @@ Legacy successful knowledge becomes verified/trusted only where prior failures
 do not contradict it. Reopening the database does not reset verification state.
 All runtime SQLite databases and sidecars remain ignored by Git.
 
-Ollama's prompt now describes its teacher role and ALPHA's existing local actions.
+Ollama's prompt describes its teacher role and ALPHA's existing local actions.
 When an explicitly configured model is absent, available installed names are
 reported; ALPHA does not silently select another model or download one. With no
-configured model, Phase 1's deterministic installed-model selection is preserved.
+configured model (an explicit empty setting), deterministic installed-model
+selection is preserved, limited to local non-embedding models. The application
+default is now explicitly `gemma4:e4b`.
+
+## Local model roles and optional semantic memory
+
+The primary fallback is **gemma4:e4b**. **qwen3.5:0.8b** is available only through
+the explicit `provider.lightweight(text, task=...)` API for short classification,
+summarization, tags, and choosing among a bounded option list. It is not called
+automatically for known commands, feedback, learning, or ordinary reasoning.
+Fast-model failure returns a helpful failure without silently switching roles.
+
+**nomic-embed-text:latest** generates local embeddings through `/api/embed`.
+Generation and embedding roles have separate configured models. Startup fetches
+the local model list once and reports each role without loading models or building
+an index. Missing roles report installed local alternatives; no downloads occur.
+
+The provider accepts only loopback HTTP, disables environment proxies, refuses
+redirects and embedded URL credentials, and rejects cloud model names and models
+advertised with remote-host/model metadata. These rules also apply to fast and
+embedding requests. No external inference opt-out is introduced in this phase.
+The existing live voice/cloud mode is separate and remains available through its
+previous paths; this guarantee covers the offline-brain Ollama traffic.
+
+Request priority after deterministic feedback/inspection/teaching controls:
+exact command → registered action → alias → routine → verified exact memory →
+recent context → deterministic fuzzy matching → semantic memory → primary
+reasoning. Any strong local result returns before the primary, fast, or embedding
+provider is called. Semantic results are text recommendations, never executable
+plans. Confirmation rules are unchanged.
+
+`core/memory/semantic_index.py` adds a lazy SQLite BLOB cache at
+`memory/semantic_cache.db`. It stores model, typed namespace, item ID, SHA-256
+content hash, dimension, float32 vector, and timestamp; **no raw document or query
+text is cached**. Learned knowledge remains in its existing table. A separate
+`learned_solution` namespace preserves room for future explicit personal-memory
+adapters (preferences, people, goals, projects, and summaries) without merging
+their source stores or automatically indexing private profile data.
+
+Only verified/trusted, filtered learned solutions enter retrieval. Up to 200
+recent eligible records are considered per lookup; embeddings are batched in
+groups of 16. Cosine matching requires at least 0.80 similarity, then reranks
+using stored confidence, verification state, success count, recent updates,
+explicit teaching/corrections, and an importance value (0.5 until a source adapter
+provides one). Recent explicit corrections outrank otherwise equal older matches.
+Candidates and rejected knowledge cannot answer through semantics.
+
+Content hashes invalidate changed/corrected document vectors. Different model
+names use separate caches. Query-vector retention is bounded to 100 entries.
+Cache connections close after each lookup. Clear the ignored cache manually if a
+model is replaced with different weights under the same name. No full vector
+database, neural search library, or new runtime dependency is required.
+
+Semantic retrieval is optional and lazy. Disabled semantics, unsupported embedding
+providers, absent models, invalid vectors, unavailable Ollama, and cache failures
+fall through to primary reasoning or the existing offline-unknown response.
+The embedding timeout is bounded at 45 seconds to allow cold loading; this wait
+occurs only after deterministic paths fail. First indexing is slower than reuse.
+
+Learning still defaults to `ALPHA_AUTO_LEARN_OLLAMA=false`. The existing pipeline
+filters before extraction/deduplication, stores lower-confidence candidates only
+when enabled or explicitly requested, and verifies only through feedback.
+Long usable replies are deterministically distilled into up to four complete
+leading sentences/lines and at most 800 characters. Oversized raw output,
+terminal-sized dumps, and sensitive output are rejected. Feedback compares the
+distilled answer to saved content, so compaction cannot verify a conflicting answer.
+
+Run the non-destructive manual check:
+
+```
+python scripts/ollama_smoke_test.py
+```
+
+It checks all roles, sends one tiny generation request (thinking disabled for that
+test only), sends a harmless embedding request, and measures local routes and
+first/cached semantic retrieval with a temporary synthetic memory store. It does
+not print model answers, vectors, credentials, or personal memory, and performs
+no Windows action. Cold-load latency depends on hardware/model residency; timing
+reports are measurements, not test assertions.
+
+API references: [Ollama embeddings](https://docs.ollama.com/api/embed) and
+[local model listing](https://docs.ollama.com/api/tags).
+
+No changes to `ui.py`, talking face, layout, controls, shortcuts, visible branding,
+or frontend framework are required for this integration.
 
 ## Validation and Phase 3
 
@@ -269,9 +360,9 @@ Run `python -m unittest discover -s tests -v` or `python -m pytest`, then
 `python -m compileall -q .` and `git diff --check`. Tests use temporary databases
 and mocked HTTP and require no Ollama service or GUI dependencies.
 
-Phase 3: offline voice, candidate/conflict review in the existing UI, structured
+Next steps: offline voice, candidate/conflict review behind the existing UI, structured
 outcome adapters for more actions, per-session/user context isolation, indexed
 token search and bounded retention, and Windows end-to-end action tests. Confirm
 learning quality before extending automation. Live Gemini/Deepgram paths and the
-existing UI remain available. No vectors, embeddings, model dumps, self-modifying
+existing UI remain available. No model dumps, self-modifying
 code, automatic model downloads, or unrestricted autonomy are included here.

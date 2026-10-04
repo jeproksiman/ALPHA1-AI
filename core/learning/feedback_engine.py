@@ -24,6 +24,8 @@ class FeedbackEngine:
         if kind in item.feedback:
             return self.brain.result('That feedback has already been recorded for this interaction.', intent='feedback')
         knowledge_id = item.result.get('knowledge_id')
+        extracted = self.brain.learner.extractor.extract(item.user_input,item.result['text'])
+        comparable = extracted['response'] if extracted else item.result['text']
         if item.result.get('command_phrase'):
             if kind == 'remember':
                 item.feedback.add(kind)
@@ -40,7 +42,7 @@ class FeedbackEngine:
             return self.brain.result('Use an explicit alias to correct an application or project target.', intent='feedback')
         if kind == 'failure' and not knowledge_id:
             existing = self.brain.memory.search(item.user_input,fuzzy=False)
-            if existing and existing['response'] == item.result['text']:
+            if existing and existing['response'] == comparable:
                 knowledge_id = existing['id']
                 item.result['knowledge_id'] = knowledge_id
             # Explicit negative feedback permits filtered failure diagnostics, never reuse.
@@ -52,7 +54,7 @@ class FeedbackEngine:
         stored = self.brain.memory.get_knowledge(knowledge_id)
         # A duplicate candidate can have a different proposed answer. Never verify the old
         # response using feedback on the new conflicting answer.
-        if stored['response'] != item.result['text']:
+        if stored['response'] != comparable:
             return self.brain.result('This answer conflicts with saved knowledge. Use "the correct solution is ..." to replace it explicitly.', intent='feedback') if not correction else self._correct(item, knowledge_id, correction.group(1))
         if correction:
             return self._correct(item, knowledge_id, correction.group(1))

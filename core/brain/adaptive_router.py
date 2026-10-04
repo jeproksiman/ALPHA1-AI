@@ -41,7 +41,7 @@ class AdaptiveRouter:
             return self.project_factory('open',target[8:]) if self.project_factory else None
         return self.resolve_command(target, seen)
 
-    def handle(self, text):
+    def handle(self, text, include_context=True):
         clean = re.sub(r'^alpha[, ]+','',text.strip(),flags=re.I).strip().rstrip('.?!')
         query = normalize(clean)
         inspection = self._inspect(clean,query)
@@ -59,9 +59,17 @@ class AdaptiveRouter:
         if alias or correction:
             match = alias or correction
             return self._alias(match[1].strip(), match[2].strip())
+        command = self.resolve_command(clean)
+        if command and normalize(command.phrase) != query:
+            return self.brain._execute(command,0.98,{},exact=False)
         routine = self.brain.routines.get(query)
         if routine:
             return self._routine(query)
+        if query.startswith(('when i say','no by')):
+            return self.brain.result('Please give an explicit alias or a colon-separated routine.',intent='clarification')
+        return self.recent(query) if include_context else None
+
+    def recent(self, query):
         if query in {'again','do that again','repeat that','same thing'}:
             item = self.brain.context.repeatable()
             if not item:
@@ -90,12 +98,6 @@ class AdaptiveRouter:
                 return self.brain.result('That contextual action is not registered. Please specify a supported action.',intent='clarification')
             # Pronouns always pass the existing gate, even when the entity is recent.
             return self.brain._execute(command,0.90,{},exact=False)
-        command = self.resolve_command(clean)
-        if command and normalize(command.phrase) != query:
-            return self.brain._execute(command,0.98,{},exact=False)
-        # Prevent malformed learning/control grammar from becoming a fuzzy action.
-        if query.startswith(('when i say','no by')):
-            return self.brain.result('Please give an explicit alias or a colon-separated routine.',intent='clarification')
         return None
 
     def _alias(self, phrase, target):

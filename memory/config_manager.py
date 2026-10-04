@@ -17,8 +17,8 @@ def get_offline_brain_settings() -> dict:
     """Environment overrides the existing local config; never writes credentials."""
     cfg = load_api_keys()
 
-    def value(name, default, legacy=None):
-        return os.environ.get(name, cfg.get(name.lower(), cfg.get(legacy, default) if legacy else default))
+    def value(name, default):
+        return os.environ.get(name, cfg.get(name.lower(), default))
 
     def flag(name, default):
         return str(value(name, default)).strip().lower() in ('true', '1', 'yes', 'on')
@@ -29,13 +29,15 @@ def get_offline_brain_settings() -> dict:
             threshold = 0.80
     except (TypeError, ValueError):
         threshold = 0.80
-    # Reuse legacy Ollama settings only when they really describe Ollama.
-    legacy_ollama = cfg.get('llm_provider', 'ollama') == 'ollama'
     return {
         'enabled': flag('ALPHA_OFFLINE_BRAIN_ENABLED', True),
         'ollama_enabled': flag('ALPHA_OLLAMA_ENABLED', True),
-        'ollama_url': value('ALPHA_OLLAMA_URL', 'http://127.0.0.1:11434', 'llm_url' if legacy_ollama else None),
-        'ollama_model': value('ALPHA_OLLAMA_MODEL', '', 'llm_model' if legacy_ollama else None),
+        'ollama_url': value('ALPHA_OLLAMA_URL', 'http://127.0.0.1:11434'),
+        'ollama_model': value('ALPHA_OLLAMA_MODEL', 'gemma4:e4b'),
+        'ollama_fast_model': value('ALPHA_OLLAMA_FAST_MODEL', 'qwen3.5:0.8b'),
+        'semantic_enabled': flag('ALPHA_SEMANTIC_MEMORY', True),
+        'embedding_provider': value('ALPHA_EMBEDDING_PROVIDER', 'ollama'),
+        'embedding_model': value('ALPHA_EMBEDDING_MODEL', 'nomic-embed-text:latest'),
         'local_threshold': threshold,
         'auto_learn': flag('ALPHA_AUTO_LEARN_OLLAMA', False),
     }

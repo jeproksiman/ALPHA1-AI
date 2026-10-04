@@ -39,6 +39,19 @@ class KnowledgeExtractor:
         response = response.strip()
         if len(response) < 12 or response.count("\n") > 25:
             return None
+        if len(response)>800:
+            # Retain whole leading sentences/lines, never an arbitrary truncated dump.
+            units = re.split(r'(?<=[.!?])\s+|\n+',response)
+            concise = []
+            for unit in units:
+                if sum(len(value)+1 for value in concise)+len(unit)>800:
+                    break
+                concise.append(unit.strip())
+                if len(concise)>=4:
+                    break
+            response = ' '.join(concise)
+            if len(response)<12:
+                return None
         return {"topic": " ".join(user_input.split())[:100],
                 "trigger_text": user_input.strip(), "response": response,
                 "solution": response}

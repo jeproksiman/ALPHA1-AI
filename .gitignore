@@ -48,3 +48,8 @@ memory/*.sqlite*
 memory/long_term.json
 memory/last_session.json
 .pytest_cache/
+
+# Local embedding/vector caches and Ollama model data
+memory/embedding_cache/
+memory/vector_indexes/
+.ollama/

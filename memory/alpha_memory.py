@@ -15,6 +15,7 @@ class AlphaMemory:
     def __init__(self, path=None):
         path = Path(path) if path is not None else BASE_DIR / "memory" / "alpha_memory.db"
         path.parent.mkdir(parents=True, exist_ok=True)
+        self.path = path
         self._lock = RLock()
         self.db = sqlite3.connect(str(path), timeout=5, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
@@ -255,6 +256,14 @@ class AlphaMemory:
         with self._lock:
             return {name:self.db.execute(f'SELECT count(*) FROM {table}').fetchone()[0]
                     for name,table in [('knowledge','learned_knowledge'),('aliases','aliases'),('routines','routines')]}
+
+    def semantic_candidates(self, limit=200):
+        """Typed learned-solution adapter; personal profile memory stays separate."""
+        with self._lock:
+            rows = self.db.execute('''SELECT * FROM learned_knowledge
+                WHERE verification_status IN ('verified','trusted')
+                ORDER BY updated_at DESC,confidence DESC LIMIT ?''',(max(1,min(limit,500)),)).fetchall()
+        return [dict(row) for row in rows if not unsafe_to_learn(json.dumps(dict(row)))]
 
     def record_correction(self, original_input, wrong_result, corrected_result):
         if any(unsafe_to_learn(v) or len(v) > 2000 for v in (original_input, wrong_result, corrected_result)):

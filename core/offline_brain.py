@@ -30,12 +30,18 @@ class Command:
 
 class OfflineBrain:
     def __init__(self, memory=None, provider=None, settings=None, skill_matcher=None,
-                 context_matcher=None, confirmer=None):
+                 context_matcher=None, confirmer=None, semantic_index=None):
         self.settings = settings if settings is not None else get_offline_brain_settings()
         self.memory = memory if memory is not None else AlphaMemory()
         self.provider = provider if provider is not None else OllamaProvider(
             self.settings.get('ollama_url', 'http://127.0.0.1:11434'),
-            self.settings.get('ollama_model', ''), self.settings.get('ollama_enabled', True))
+            self.settings.get('ollama_model', 'gemma4:e4b'), self.settings.get('ollama_enabled', True),
+            fast_model=self.settings.get('ollama_fast_model','qwen3.5:0.8b'),
+            embedding_model=self.settings.get('embedding_model','nomic-embed-text:latest'))
+        from core.memory.semantic_index import SemanticIndex
+        self.semantic = semantic_index if semantic_index is not None else SemanticIndex(
+            self.memory,self.provider,enabled=self.settings.get('semantic_enabled',True)
+            and self.settings.get('embedding_provider','ollama')=='ollama')
         self.learner = Learner(self.memory)
         self.commands = {}
         self.skill_matcher = skill_matcher
@@ -92,7 +98,7 @@ class OfflineBrain:
     def _threshold(self):
         return max(0.80, clamp(self.settings.get('local_threshold', 0.80)))
 
-    def lookup_local(self, text, context=None):
+    def lookup_local(self, text, context=None, commands_only=False):
         """No network; None means the legacy pipeline may continue unchanged."""
         context = context or {}
         query = normalize(text)
@@ -106,6 +112,8 @@ class OfflineBrain:
             match = self.skill_matcher(text, context)
             if match and clamp(match[1]) >= self._threshold():
                 return self._execute(match[0], match[1], context, exact=True)
+        if commands_only:
+            return None
         alias = self.memory.get_alias(text)
         if alias and alias['confidence'] >= self._threshold():
             command = self.commands.get(normalize(alias['target']))
@@ -115,6 +123,9 @@ class OfflineBrain:
         if learned and learned['confidence'] >= self._threshold() and not unsafe_to_learn(learned['response']):
             self.memory.mark_used(learned['id'])
             return self.result(learned['response'], 'memory', learned['confidence'], 'learned_solution', knowledge_id=learned['id'], reason=learned['reason'])
+        recent = self.adaptive.recent(query)
+        if recent:
+            return recent
         if self.context_matcher:
             match = self.context_matcher(text, context)
             if match and clamp(match[1]) >= self._threshold():
@@ -141,37 +152,57 @@ class OfflineBrain:
             feedback = self.feedback.handle(text)
             if feedback:
                 return feedback
-            adaptive = self.adaptive.handle(text)
+            local = self.lookup_local(text,context,commands_only=True)
+            if local:
+                return self._finish(text,local)
+            adaptive = self.adaptive.handle(text,include_context=False)
             if adaptive:
                 return self._finish(text,adaptive)
             local = self.lookup_local(text, context)
             if local:
                 return self._finish(text,local)
-            if not self.settings.get('ollama_enabled', True):
-                return self._finish(text,self.result('I do not have a confident local answer. Ollama fallback is disabled.'))
             fallback_context = dict(context or {})
             fallback_context.setdefault('summary',self.context.summary())
-            answer = self.provider.generate(text, fallback_context)
-            if not answer['ok']:
-                return self._finish(text,self.result('I do not have a confident local answer. ' + answer['text']))
-            result = self.result(answer['text'], 'ollama', 0.60, 'teacher_answer')
-            if contains_secret(answer['text']):
-                return self._finish(text,self.result('The fallback response contained sensitive data and was discarded.',intent='sensitive_input'))
-            if self.settings.get('auto_learn', False):
-                knowledge_id = self.learner.learn_from_solution(text, answer['text'])
-                result['learned'] = knowledge_id is not None
-                result['knowledge_id'] = knowledge_id
-            return self._finish(text,result)
+        if self.settings.get('semantic_enabled',True) and self.settings.get('embedding_provider','ollama')=='ollama':
+            learned = self.semantic.search(text,threshold=self._threshold())
+            if learned and learned['verification_status'] in ('verified','trusted') and not unsafe_to_learn(learned['response']):
+                with self._lock:
+                    current = self.memory.get_knowledge(learned['id'])
+                    if current and current['verification_status'] in ('verified','trusted') and current['response']==learned['response']:
+                        self.memory.mark_used(learned['id'])
+                        return self._finish(text,self.result(learned['response'],'memory',learned['confidence'],
+                            'semantic_solution',knowledge_id=learned['id'],reason=learned['reason']))
+        if not self.settings.get('ollama_enabled', True):
+            return self._finish(text,self.result('I do not have a confident local answer. Ollama fallback is disabled.'))
+        answer = self.provider.generate(text, fallback_context)
+        if not answer['ok']:
+            return self._finish(text,self.result('I do not have a confident local answer. ' + answer['text']))
+        result = self.result(answer['text'], 'ollama', 0.60, 'teacher_answer')
+        if contains_secret(answer['text']):
+            return self._finish(text,self.result('The fallback response contained sensitive data and was discarded.',intent='sensitive_input'))
+        if self.settings.get('auto_learn', False):
+            knowledge_id = self.learner.learn_from_solution(text, answer['text'])
+            result['learned'] = knowledge_id is not None
+            result['knowledge_id'] = knowledge_id
+        return self._finish(text,result)
 
     def _finish(self, text, result):
         # Control/inspection replies must not replace the answer being reviewed.
-        if result['intent'] not in ('inspection','alias_learning','routine_learning','clarification','pattern_suggestion'):
-            self.context.remember(text,result)
+        with self._lock:
+            if result['intent'] not in ('inspection','alias_learning','routine_learning','clarification','pattern_suggestion'):
+                self.context.remember(text,result)
         return result
 
     def startup_report(self):
-        status = self.provider.is_available() if self.settings.get('ollama_enabled', True) else False
+        status = self.provider.model_status()
         counts = self.memory.counts()
-        return ['[ALPHA BRAIN] Offline intelligence ready',
+        lines = ['[ALPHA BRAIN] Offline-first ready',
                 f"[MEMORY] {counts['knowledge']} learned items, {counts['aliases']} aliases, {counts['routines']} routines",
-                '[OLLAMA] Available: ' + ('yes' if status else 'no'), '[LEARNING] Verified learning enabled']
+                '[LEARNING] Verified learning enabled']
+        for role,label in [('primary','OLLAMA'),('fast','OLLAMA FAST'),('embedding','SEMANTIC MEMORY')]:
+            info = status['roles'][role]
+            disabled = role=='embedding' and not self.settings.get('semantic_enabled',True)
+            lines.append(f"[{label}] {info['model']} "+('disabled' if disabled else 'ready' if info['ready'] else 'unavailable'))
+        if any(not info['ready'] for info in status['roles'].values()) and status['available']:
+            lines.append('[OLLAMA] Installed local alternatives: '+(', '.join(status['installed']) or 'none'))
+        return lines
