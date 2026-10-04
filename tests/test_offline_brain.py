@@ -31,7 +31,7 @@ class BrainTests(unittest.TestCase):
     def test_initialization_and_persistence(self):
         tables = {r[0] for r in self.memory.db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         self.assertEqual(tables, {'learned_knowledge', 'aliases', 'corrections', 'interaction_history',
-                                  'confidence_events','knowledge_conflicts','routines','routine_steps'})
+                                  'confidence_events','knowledge_conflicts','routines','routine_steps','conversation_state','companion_facts'})
         self.memory.store_solution('question', 'A persistent local answer.', source='user',confidence=0.9)
         other = AlphaMemory(self.path)
         self.assertEqual(other.search('QUESTION!')['response'], 'A persistent local answer.')

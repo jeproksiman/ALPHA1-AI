@@ -49,6 +49,8 @@ class OfflineBrain:
         self.confirmer = confirmer
         self._lock = RLock()
         self.context = ContextManager()
+        from core.context.companion import Companion
+        self.companion = Companion(self.memory)
         self.patterns = PatternDetector()
         self.feedback = FeedbackEngine(self)
         from core.brain.adaptive_router import AdaptiveRouter
@@ -149,9 +151,14 @@ class OfflineBrain:
                 return self.result('Please enter a request.', intent='empty')
             if contains_secret(text) or (context and contains_secret(context.get('summary', ''))):
                 return self.result('Sensitive input is not sent to the fallback or stored.', intent='sensitive_input')
+            if normalize(text) == 'remember this':
+                self.companion.handle(text)  # also retain the user's preceding message
             feedback = self.feedback.handle(text)
             if feedback:
                 return feedback
+            companion_reply = self.companion.handle(text)
+            if companion_reply:
+                return self._finish(text,self.result(companion_reply,intent='inspection'))
             local = self.lookup_local(text,context,commands_only=True)
             if local:
                 return self._finish(text,local)
@@ -162,9 +169,17 @@ class OfflineBrain:
             if local:
                 return self._finish(text,local)
             fallback_context = dict(context or {})
-            fallback_context.setdefault('summary',self.context.summary())
+            fallback_context.setdefault('summary',self.companion.prompt(text))
+            tokens=set(normalize(text).split())
+            relevant=[row for row in self.memory.semantic_candidates(20)
+                      if len(tokens.intersection(normalize(row['trigger_text']).split()))>=2][:2]
+            if relevant:
+                fallback_context['summary']=(fallback_context['summary'][:1400]+'\nRelevant verified knowledge:\n'+
+                    '\n'.join(row['trigger_text'][:80]+': '+row['response'][:180] for row in relevant))[:2000]
         if self.settings.get('semantic_enabled',True) and self.settings.get('embedding_provider','ollama')=='ollama':
             learned = self.semantic.search(text,threshold=self._threshold())
+            if fallback_context.get('_cancel') and fallback_context['_cancel'].is_set():
+                return self.result('Interrupted.',intent='cancelled')
             if learned and learned['verification_status'] in ('verified','trusted') and not unsafe_to_learn(learned['response']):
                 with self._lock:
                     current = self.memory.get_knowledge(learned['id'])
@@ -175,6 +190,8 @@ class OfflineBrain:
         if not self.settings.get('ollama_enabled', True):
             return self._finish(text,self.result('I do not have a confident local answer. Ollama fallback is disabled.'))
         answer = self.provider.generate(text, fallback_context)
+        if fallback_context.get('_cancel') and fallback_context['_cancel'].is_set():
+            return self.result('Interrupted.',intent='cancelled')
         if not answer['ok']:
             return self._finish(text,self.result('I do not have a confident local answer. ' + answer['text']))
         result = self.result(answer['text'], 'ollama', 0.60, 'teacher_answer')
@@ -189,6 +206,10 @@ class OfflineBrain:
     def _finish(self, text, result):
         # Control/inspection replies must not replace the answer being reviewed.
         with self._lock:
+            if normalize(text) != 'forget that' and result['intent'] != 'sensitive_input':
+                entity = result.get('entity') or {}
+                self.companion.record(text,result['text'],inspection=bool(result.get('action_name')) or (result['intent']=='inspection' and not text.lower().startswith(('remember','my name','call me','i prefer','i am','i\x27m'))),
+                                      project=entity.get('name','') if entity.get('kind')=='project' else '')
             if result['intent'] not in ('inspection','alias_learning','routine_learning','clarification','pattern_suggestion'):
                 self.context.remember(text,result)
         return result

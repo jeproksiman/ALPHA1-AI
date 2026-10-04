@@ -1,6 +1,7 @@
 """Bounded, text-only Ollama fallback. Never starts services or pulls models."""
 from urllib.parse import urlsplit
 import math
+import json
 import re
 import requests
 from core.learning.knowledge_extractor import contains_secret
@@ -73,7 +74,9 @@ class OllamaProvider:
                 'roles':{role:{'model':model,'ready':bool(status['available'] and self._model(role,status))}
                          for role,model in [('primary',self.model),('fast',self.fast_model),('embedding',self.embedding_model)]}}
 
-    def chat(self, messages, role='primary', max_tokens=600, think=None):
+    def chat(self, messages, role='primary', max_tokens=600, think=None, cancel=None):
+        if cancel is not None and cancel.is_set():
+            return {'ok':False,'text':'Interrupted.'}
         if role not in ('primary','fast'):
             return {'ok':False,'text':'Invalid generation role.'}
         if contains_secret(str(messages)):
@@ -87,16 +90,36 @@ class OllamaProvider:
             return {'ok': False, 'text': 'Configured Ollama model is not installed. Available models: '
                     + available + '. Configure an installed local model explicitly.'}
         try:
-            payload = {'model':model,'messages':messages,'stream':False,
+            payload = {'model':model,'messages':messages,'stream':cancel is not None,'keep_alive':'2m',
                        'options':{'num_predict':max(1,min(max_tokens,600))}}
             if think is not None:
                 payload['think'] = bool(think)
+            kwargs = {'stream':True} if cancel is not None else {}
             response = self.session.post(self.url + '/api/chat',
                 json=payload,
-                timeout=(3, self.timeout), allow_redirects=False)
+                timeout=(3, self.timeout), allow_redirects=False, **kwargs)
             if response.status_code != 200:
                 raise ValueError('Invalid HTTP status')
-            data = response.json()
+            if cancel is not None:
+                parts, done = [], False
+                try:
+                    for line in response.iter_lines(chunk_size=128):
+                        if cancel.is_set():
+                            return {'ok':False,'text':'Interrupted.'}
+                        if not line:
+                            continue
+                        chunk = json.loads(line)
+                        parts.append(chunk.get('message',{}).get('content',''))
+                        if sum(len(p) for p in parts)>4000:
+                            raise ValueError('Oversized response')
+                        if chunk.get('done'):
+                            done=True
+                            break
+                    data={'done':done,'message':{'content':''.join(parts)}}
+                finally:
+                    response.close()
+            else:
+                data = response.json()
             text = data['message']['content']
             if not isinstance(text, str) or not text.strip() or data.get('done') is not True:
                 raise ValueError('Incomplete response')
@@ -108,7 +131,7 @@ class OllamaProvider:
 
     def generate(self, text, context=None):
         messages = [{'role': 'system', 'content':
-            'You are ALPHA\'s local teacher and reasoning fallback. ALPHA already '
+            'You are the same companion described in the shared local context. ALPHA already '
             'handles registered local actions and verified knowledge. Answer only the '
             'unresolved question with a concise, reusable text solution. Do not claim '
             'that actions were executed. You cannot execute tools. Do not request or '
@@ -117,7 +140,15 @@ class OllamaProvider:
         if context and isinstance(context.get('summary'), str):
             messages.append({'role': 'system', 'content': context['summary'][:2000]})
         messages.append({'role': 'user', 'content': text})
-        return self.chat(messages)
+        cancel = context.get('_cancel') if context else None
+        return self.chat(messages,cancel=cancel) if cancel is not None else self.chat(messages)
+
+    def warmup(self, cancel):
+        if cancel.is_set():
+            return
+        self.chat([{'role':'user','content':'Reply ready.'}],max_tokens=1,think=False,cancel=cancel)
+        if not cancel.is_set():
+            self.embed('Local conversation context.')
 
     def lightweight(self, text, task='summarize', options=None):
         """Explicit opt-in only. Output is advisory text, never an action authorization."""
@@ -140,7 +171,7 @@ class OllamaProvider:
         if not model:
             return {'ok':False,'embeddings':[],'error':'Configured local embedding model is unavailable.'}
         try:
-            response = self.session.post(self.url+'/api/embed',json={'model':model,'input':texts,'truncate':False},
+            response = self.session.post(self.url+'/api/embed',json={'model':model,'input':texts,'truncate':False,'keep_alive':'1m'},
                 timeout=(3,min(self.timeout,45)),allow_redirects=False)
             if response.status_code!=200:
                 raise ValueError('Invalid HTTP status')

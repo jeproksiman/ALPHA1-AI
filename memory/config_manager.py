@@ -17,11 +17,22 @@ def get_runtime_settings() -> dict:
     cfg = load_api_keys()
     def value(name, default):
         return os.environ.get(name, cfg.get(name.lower(), default))
+    def flag(name, default):
+        return str(value(name, default)).lower() in ('true', '1', 'yes', 'on')
     mode = str(value('ALPHA_RUNTIME_MODE', 'auto')).strip().lower()
     return {
         'mode': mode if mode in ('auto', 'offline', 'live') else 'auto',
         'vosk_model_path': str(value('ALPHA_OFFLINE_STT_MODEL_PATH', '')).strip(),
-        'tts_enabled': str(value('ALPHA_OFFLINE_TTS', 'false')).lower() in ('true', '1', 'yes', 'on'),
+        'stt_provider': value('ALPHA_OFFLINE_STT_PROVIDER', 'faster-whisper'),
+        'whisper_model': value('ALPHA_WHISPER_MODEL', 'small'),
+        'whisper_device': value('ALPHA_WHISPER_DEVICE', 'auto'),
+        'whisper_compute_type': value('ALPHA_WHISPER_COMPUTE_TYPE', 'auto'),
+        'allow_download': flag('ALPHA_ALLOW_MODEL_DOWNLOAD', False),
+        'tts_provider': value('ALPHA_OFFLINE_TTS_PROVIDER', 'auto'),
+        'piper_voice_path': value('ALPHA_PIPER_VOICE_PATH', ''),
+        'tts_enabled': flag('ALPHA_TTS_ENABLED', value('ALPHA_OFFLINE_TTS', True)),
+        'warmup': flag('ALPHA_OFFLINE_WARMUP', True),
+        'barge_in': flag('ALPHA_OFFLINE_BARGE_IN', False),
     }
 
 

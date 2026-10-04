@@ -91,11 +91,15 @@ PyPDF2                       # file_processor — PDF fallback reader
 python-docx                  # file_processor — .docx reading
 pynvml                       # system_monitor + the HUD's GPU meter (NVIDIA)
 
+# Offline speech backend. Model assets are resolved locally; never pulled by default.
+faster-whisper>=1.2,<2
+
 # ── Optional: heavy extras, install only if you want the feature ──────────────
 # Left out on purpose — together they are several hundred megabytes, which is a
 # lot to download for a fresh clone that may never use them.
 #
 #   pip install pandas       # file_processor: spreadsheet/CSV analysis
+#   pip install piper-tts      # optional local voice with configured .onnx + .json
 #   pip install pydub        # file_processor: audio metadata and conversion
 #                            #   (also needs ffmpeg on PATH for most formats)
 #   pip install mediapipe    # pushup_counter: elbow-angle rep detection

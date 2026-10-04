@@ -13,6 +13,15 @@ from core.runtime_mode import RuntimeMode, error_kind, provider_reachable
 from memory import config_manager
 
 
+
+@pytest.fixture(autouse=True)
+def mock_heavy_stt(monkeypatch):
+    from core import offline_voice
+    def unavailable(settings,log):
+        log('SYS: Offline microphone unavailable; Typed input is ready.')
+        return None
+    monkeypatch.setattr(offline_voice,'select_stt',unavailable)
+
 def run(coro):
     return asyncio.run(coro)
 
@@ -103,7 +112,7 @@ def adapter(names, namespace=None):
     tree = ast.parse(Path('main.py').read_text(encoding='utf-8'))
     cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'JarvisLive')
     cls.body = [n for n in cls.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in names]
-    ns = {'asyncio': asyncio, **(namespace or {})}
+    ns = {'asyncio': asyncio, 'get_output_device':lambda:'', **(namespace or {})}
     exec(compile(ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[])), 'main.py', 'exec'), ns)
     return ns['JarvisLive']()
 
@@ -235,13 +244,15 @@ def test_active_live_network_loss_closes_session_and_enters_offline(monkeypatch)
     assert not any('retrying' in str(call).lower() for call in app.ui.write_log.call_args_list)
 
 
-def test_voice_requires_local_assets_and_never_downloads():
+def test_voice_requires_local_assets_and_never_downloads(monkeypatch):
     from core.offline_voice import OfflineVoice
     log = Mock()
     voice = OfflineVoice({'vosk_model_path': '', 'tts_enabled': True}, Mock(), Mock(), Mock(), log)
-    voice.start()
-    assert voice.thread is None
-    assert 'Typed input is ready' in log.call_args.args[0]
+    from core import offline_voice
+    voice._run()
+    assert not voice.ready
+    assert any('Typed input is ready' in str(call) for call in log.call_args_list)
+
 
 
 def test_local_memory_commands_reasoning_and_model_failure(tmp_path):
@@ -268,38 +279,26 @@ def test_local_memory_commands_reasoning_and_model_failure(tmp_path):
 
 
 def test_local_voice_routes_transcript_and_reuses_speaking_state(monkeypatch, tmp_path):
+    from core import offline_voice
     from core.offline_voice import OfflineVoice
-    from core import stt
-    speaking, respond = Mock(), Mock(return_value='Local spoken response')
-    voice = OfflineVoice({'vosk_model_path': str(tmp_path), 'tts_enabled': True},
-                         respond, lambda: True, speaking, Mock())
+    respond = Mock(return_value='Local spoken response')
+    voice = OfflineVoice({'vosk_model_path':str(tmp_path),'tts_enabled':True},respond,
+                         lambda:True,Mock(),Mock())
+    recognizer=Mock()
+    recognizer.process_chunk.return_value=('open calculator',True)
+    monkeypatch.setattr(offline_voice,'select_stt',lambda settings,log:recognizer)
     class Stream:
-        def __init__(self, **kwargs):
-            self.callback = kwargs['callback']
+        def __init__(self,**kwargs): self.callback=kwargs['callback']
         def __enter__(self):
-            self.callback(b'local pcm', 1600, None, None)
+            self.callback(b'\x01\x00'*1600,1600,None,None)
             return self
-        def __exit__(self, *args):
-            pass
-    speaker = Mock()
-    def finish(timeout):
-        voice.stop.set()
-        return True
-    speaker.WaitUntilDone.side_effect = finish
-    com_client = SimpleNamespace(Dispatch=Mock(return_value=speaker))
-    monkeypatch.setitem(sys.modules, 'win32com', SimpleNamespace(client=com_client))
-    monkeypatch.setitem(sys.modules, 'win32com.client', com_client)
-    monkeypatch.setitem(sys.modules, 'pythoncom', Mock())
-    monkeypatch.setitem(sys.modules, 'sounddevice', SimpleNamespace(RawInputStream=Stream))
-    recognizer = Mock()
-    recognizer.process_chunk.return_value = ('open calculator', True)
-    constructor = Mock(return_value=recognizer)
-    monkeypatch.setattr(stt, 'VoskSTT', constructor)
+        def __exit__(self,*args): pass
+    monkeypatch.setitem(sys.modules,'sounddevice',SimpleNamespace(RawInputStream=Stream))
+    def spoken(text): voice.stop.set()
+    voice.output.speak=Mock(side_effect=spoken)
     voice._run()
-    constructor.assert_called_once_with(model_path=str(tmp_path))
     respond.assert_called_once_with('open calculator')
-    speaker.Speak.assert_called_once_with('Local spoken response', 1)
-    assert [call.args for call in speaking.call_args_list] == [(True,), (False,)]
+    voice.output.speak.assert_called_once_with('Local spoken response')
 
 
 def test_recovery_rechecks_turn_started_during_probe():

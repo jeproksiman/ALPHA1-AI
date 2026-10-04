@@ -476,6 +476,11 @@ class HudCanvas(QWidget):
         except Exception:
             pass
 
+    def clear_speech_frames(self) -> None:
+        """Backend interruption hook; clear pending audio-driven mouth frames."""
+        self._visemes = self._vis_i = None
+        self._live_amp = self._amp_disp = 0.0
+
     def push_visemes(self, frames, hop: float, at: float) -> None:
         """Thread-safe: hand over a schedule of (level, openness, width) frames.
 
@@ -5596,7 +5601,8 @@ class MainWindow(QMainWindow):
         txt = self._input.text().strip()
         if not txt: return
         self._input.clear()
-        self._log.append_log(f"You: {txt}")
+        from core.learning.knowledge_extractor import contains_secret
+        self._log.append_log('You: '+('Sensitive input withheld.' if contains_secret(txt) else txt))
         callback = getattr(self, 'on_offline_text_command', None) or self.on_text_command
         if callback:
             threading.Thread(target=callback, args=(txt,), daemon=True).start()
@@ -5820,6 +5826,9 @@ class JarvisUI:
 
     def notify_phone_connected(self) -> None:
         self._win.notify_phone_connected()
+
+    def clear_speech_frames(self) -> None:
+        self._win.hud.clear_speech_frames()
 
     def set_state(self, state: str):
         self._win._state_sig.emit(state)

@@ -11,46 +11,18 @@ import numpy as np
 class WhisperSTT:
     """Offline transcription using faster-whisper."""
 
-    def __init__(self, model_name: str = "base", language: str | None = None):
-        import os
+    def __init__(self, model_name="small", language=None, device="auto", compute_type="auto",
+                 allow_download=False, cpu_threads=2):
         from faster_whisper import WhisperModel
-        print(f"[STT] Loading Whisper '{model_name}'…")
-        try:
-            import torch
-            device  = "cuda" if torch.cuda.is_available() else "cpu"
-            compute = "float16" if device == "cuda" else "int8"
-        except Exception:
-            device, compute = "cpu", "int8"
+        # CPU/int8 keeps GPU memory available for Ollama; CUDA is explicit opt-in.
+        device = "cpu" if device == "auto" else device
+        compute_type = ("int8" if device == "cpu" else "float16") if compute_type == "auto" else compute_type
+        self._model = WhisperModel(model_name, device=device, compute_type=compute_type,
+                                   local_files_only=not allow_download, cpu_threads=cpu_threads, num_workers=1)
+        self._language = None if not language or language == "auto" else language
 
-        try:
-            self._model = WhisperModel(model_name, device=device, compute_type=compute)
-        except Exception as _first_err:
-            # Offline flag set but model not cached yet → clear flags and download once.
-            # Keywords cover multiple huggingface_hub error message variants across versions.
-            _e = str(_first_err).lower()
-            _offline_keywords = (
-                "offline", "not found", "cache", "localentry",
-                "does not exist", "outgoing", "local_files_only",
-            )
-            if any(k in _e for k in _offline_keywords):
-                print(f"[STT] Whisper '{model_name}' not in local cache — downloading (one-time, internet required)…")
-                os.environ.pop("HF_HUB_OFFLINE",      None)
-                os.environ.pop("TRANSFORMERS_OFFLINE", None)
-                os.environ.pop("HF_DATASETS_OFFLINE",  None)
-                try:
-                    self._model = WhisperModel(model_name, device=device, compute_type=compute)
-                except Exception as _dl_err:
-                    raise RuntimeError(
-                        f"Whisper '{model_name}' model download failed.\n"
-                        f"Internet access is required the first time to download the speech model (~75–290 MB).\n"
-                        f"After the first download it runs fully offline.\n"
-                        f"Details: {_dl_err}"
-                    ) from _dl_err
-            else:
-                raise
-
-        self._language = None if (not language or language.strip().lower() == "auto") else language.strip().lower()
-        print(f"[STT] Whisper '{model_name}' ready ({device})")
+    def close(self):
+        self._model = None
 
     def transcribe(self, audio: np.ndarray) -> str:
         """Transcribe a float32 mono 16 kHz numpy array. Returns transcript string."""

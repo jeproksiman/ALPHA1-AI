@@ -87,6 +87,7 @@ from core.brain.app_commands   import configure_app_commands
 from memory.config_manager    import get_offline_brain_settings, get_runtime_settings, load_api_keys
 from core.runtime_mode        import RuntimeMode, error_kind
 from core.offline_voice       import OfflineVoice
+from core.learning.knowledge_extractor import contains_secret
 from core.viseme               import VisemeStream
 from core.wake_word            import (
     WakeWordDetector, is_ready as wake_is_ready, install_and_download as wake_install,
@@ -553,6 +554,7 @@ class JarvisLive:
         self._runtime = RuntimeMode(get_runtime_settings)
         self._local_busy = 0
         self._local_lock = threading.Lock()
+        self._request_cancels = set()
         self._offline_voice = None
         self.ui             = ui
         self._asst_name     = "JARVI    S"   # updated each session from config
@@ -662,6 +664,7 @@ class JarvisLive:
             try:
                 from actions.open_app import _APP_ALIASES
                 self._offline_brain = OfflineBrain()
+                self._offline_brain.companion.profile_reader = load_memory
                 configure_app_commands(
                     self._offline_brain, self._action_registry, _APP_ALIASES,
                     player=self.ui,
@@ -877,7 +880,7 @@ class JarvisLive:
         manual = self._dashboard.get_manual_url()
         return url, key, f"{url}/auto-login?key={key}", manual
 
-    def _on_offline_text_command(self, text: str):
+    def _on_offline_text_command(self, text: str, speak_reply=True):
         # Respect wake-word sleep: a typed command must not be answered while
         # asleep either (the sleep gate is not just for the mic). Wake first with
         # "Hey Jarvis" or the WAKE NOW button.
@@ -893,14 +896,25 @@ class JarvisLive:
             use_live = False
         if self._offline_brain is not None and not use_live:
             lock = getattr(self, '_local_lock', None)
+            cancel = threading.Event() if hasattr(self,'_request_cancels') else None
             if lock:
                 with lock:
                     self._local_busy += 1
+                    if cancel is not None:
+                        self._request_cancels.add(cancel)
+            voice = getattr(self,'_offline_voice',None)
+            if offline and speak_reply and voice:
+                voice.interrupted.clear()
             try:
                 # UI submits this callback on a worker thread. No network/SQLite
                 # work blocks Qt, and no live cloud session is needed for local commands.
-                result = self._offline_brain.process(text)
+                result = self._offline_brain.process(text, {'_cancel':cancel}) if cancel else self._offline_brain.process(text)
+                if cancel is not None and cancel.is_set():
+                    return
                 self.ui.write_log('ALPHA: ' + result['text'])
+                voice = getattr(self,'_offline_voice',None)
+                if offline and speak_reply and voice:
+                    voice.speak(result['text'])
                 return result['text']
             except Exception:
                 self.ui.write_log('SYS: Offline brain could not complete this request.')
@@ -908,6 +922,8 @@ class JarvisLive:
                 if lock:
                     with lock:
                         self._local_busy -= 1
+                        if cancel is not None:
+                            self._request_cancels.discard(cancel)
             return
         if offline:
             self.ui.write_log('SYS: Offline brain unavailable; enable ALPHA_OFFLINE_BRAIN_ENABLED.')
@@ -954,10 +970,14 @@ class JarvisLive:
             # still needs it to recognise our own voice. It is dropped when the
             # tail expires. What the guard learned about the room always stays.
             self._out_level = 0.0
+            if self._runtime.offline:
+                self._visemes.reset()
+                self.ui.clear_speech_frames()
         if value:
             self.ui.set_state("SPEAKING")
         elif not self.ui.muted:
-            self.ui.set_state("LISTENING")
+            voice = getattr(self,'_offline_voice',None)
+            self.ui.set_state('OFFLINE' if self._runtime.offline and not (voice and voice.ready) else 'LISTENING')
 
     def set_push_to_talk(self, enabled: bool) -> str:
         """Turn hold-to-talk on or off. Returns the scope actually achieved."""
@@ -1003,6 +1023,7 @@ class JarvisLive:
     def interrupt(self) -> None:
         """Stop JARVIS mid-speech: drain queued audio and open mic immediately."""
         self._interrupted = True
+        self._cancel_local_responses()
         if self._offline_voice:
             self._offline_voice.interrupt()
         q = self.audio_in_queue
@@ -1023,6 +1044,36 @@ class JarvisLive:
         if self._turn_done_event:
             self._turn_done_event.clear()
         self.ui.write_log("SYS: Interrupted — listening...")
+
+    def _cancel_local_responses(self):
+        with self._local_lock:
+            for cancel in self._request_cancels:
+                cancel.set()
+
+    def _offline_audio_envelope(self, pcm, rate):
+        """Reuse live PCM analysis, transcript visemes and the same HUD schedule."""
+        samples = np.frombuffer(pcm,dtype=np.int16)
+        frames = _pcm_visemes(samples,sr=rate)
+        hop = _VIS_HOP / rate
+        if frames:
+            frames = self._visemes.frames(frames,hop)
+            now = time.time()
+            if not now <= self._play_cursor <= now+self._out_latency+_CURSOR_SLACK:
+                self._play_cursor = now+_FIRST_SOUND
+            self.ui.push_visemes(frames,hop,self._play_cursor)
+            self._play_cursor += samples.size/rate
+        level = _pcm_level(samples)
+        self.ui.set_audio_level(level)
+        self._out_level = level
+        self._echo.note_output(samples,rate,level)
+
+    def _remember_live_turn(self, user, answer):
+        if self._offline_brain:
+            with self._offline_brain._lock:
+                self._offline_brain.companion.record(user,answer,'live')
+                if user and answer:
+                    self._offline_brain.context.remember(user,self._offline_brain.result(
+                        answer,source='live',intent='companion_dialogue'))
 
     def speak(self, text: str):
         if not self._loop or not self.session:
@@ -1052,8 +1103,15 @@ class JarvisLive:
             self._asst_name = "JARVIS"
             _user_name = ""
 
+        if self._offline_brain:
+            identity = self._offline_brain.companion.facts()
+            self._asst_name = identity.get('assistant_name') or self._asst_name
+            _user_name = identity.get('preferred_name') or _user_name
+
         memory     = load_memory()
         mem_str    = format_memory_for_prompt(memory)
+        if contains_secret(mem_str):
+            mem_str = ''
         sys_prompt = _load_system_prompt()
 
         now      = datetime.now()
@@ -1107,6 +1165,8 @@ class JarvisLive:
         })
 
         parts = [time_ctx, identity_ctx]
+        if self._offline_brain:
+            parts.append(self._offline_brain.companion.prompt())
         if mem_str:
             parts.append(mem_str)
         parts.append(sys_prompt)
@@ -1614,6 +1674,9 @@ class JarvisLive:
                     self._turn_done_event.set()
                 full_in = " ".join(user_text).strip()
                 full_out = " ".join(assistant_text).strip()
+                full_in = '' if contains_secret(full_in) else full_in
+                full_out = '' if contains_secret(full_out) else full_out
+                self._remember_live_turn(full_in,full_out)
                 if full_in:
                     self._session_log.append(f"User: {full_in}")
                     self.ui.write_log(f"You: {full_in}")
@@ -1718,6 +1781,7 @@ class JarvisLive:
                                 continue
 
                             full_in = " ".join(in_buf).strip()
+                            full_in = '' if contains_secret(full_in) else full_in
                             if full_in:
                                 self._last_out_logged = ""   # new exchange
                                 self.ui.write_log(f"You: {full_in}")
@@ -1731,6 +1795,7 @@ class JarvisLive:
                             in_buf = []
 
                             full_out = " ".join(out_buf).strip()
+                            full_out = '' if contains_secret(full_out) else full_out
                             # Second line of defence: even if a repeat slips
                             # into a *fresh* buffer after a flush, never log the
                             # same answer (or a tail of it) twice in a row.
@@ -1747,6 +1812,7 @@ class JarvisLive:
                                         "text": full_out,
                                         "ts": datetime.now().isoformat(),
                                     }))
+                            self._remember_live_turn(full_in,full_out)
                             out_buf = []
 
                             if self._vision_close_pending:
@@ -2045,34 +2111,8 @@ class JarvisLive:
     # ── Session memory ──────────────────────────────────────────────────────────
 
     async def _save_session_summary(self) -> None:
-        """Summarise the current session in 1-2 sentences and save to long_term.json."""
-        log = self._session_log
-        if len(log) < 3:          # need at least one exchange to be worth saving
-            return
-        self._session_log = []    # reset immediately so the next session starts clean
-
-        memory = load_memory()
-        lang_entry = memory.get("identity", {}).get("language", {})
-        lang = (lang_entry.get("value", "") if isinstance(lang_entry, dict) else str(lang_entry)).strip()
-        lang = lang or "English"
-
-        convo = "\n".join(log[-40:])   # cap at last 40 turns to stay within token budget
-        prompt = (
-            f"Summarize this conversation in 1-2 sentences in {lang}. "
-            "Focus on what the user accomplished or discussed. "
-            "Output ONLY the summary text, nothing else:\n\n" + convo
-        )
-        try:
-            from core import gemini
-            summary = await asyncio.to_thread(
-                gemini.text, prompt, gemini.SMART, None, 30_000,
-            )
-            if summary:
-                save_session_summary(summary, lang)
-        except Exception as e:
-            print(f"[Memory] ⚠️ Session summary failed: {e}")
-
-    # ── System monitor ──────────────────────────────────────────────────────────
+        """Turns already update the authoritative local summary; no cloud summarizer."""
+        self._session_log = []
 
     async def _run_system_monitor(self) -> None:
         """Background task: voice alerts when metrics exceed thresholds."""
@@ -2255,14 +2295,24 @@ class JarvisLive:
                     self.ui.set_state('OFFLINE')
                     self._awake = True  # typed input remains usable without cloud wake audio
                     message = 'SYS: ALPHA Offline Mode active. ' + self._runtime.reason
+                    brain = getattr(self,'_offline_brain',None)
+                    if brain:
+                        topic = brain.memory.conversation_state().get('topic','')
+                        if topic:
+                            message += ' We were discussing: '+topic[:200]
                     print('[JARVIS] Offline services ready. ' + self._runtime.reason)
                     self.ui.write_log(message)
                     self._offline_voice = OfflineVoice(
-                        get_runtime_settings(), self._on_offline_text_command,
+                        get_runtime_settings(), lambda text: self._on_offline_text_command(text,speak_reply=False),
                         lambda: not self.ui.muted and not self._is_speaking and not self._tail_active() and (
                             not self._ptt_enabled or self._ptt_held),
                         self.set_speaking, self.ui.write_log,
-                        device=audio_devices.resolve(get_input_device(), 'input'))
+                        device=audio_devices.resolve(get_input_device(), 'input'),
+                        output_device=audio_devices.resolve(get_output_device(), 'output'),
+                        envelope=getattr(self,'_offline_audio_envelope',None),
+                        speech_text=getattr(getattr(self,'_visemes',None),'feed_text',None),
+                        cancel_response=getattr(self,'_cancel_local_responses',None),
+                        warmup=getattr(getattr(getattr(self,'_offline_brain',None),'provider',None),'warmup',None))
                     self._offline_voice.start()
                     announced = True
                 await asyncio.sleep(1)

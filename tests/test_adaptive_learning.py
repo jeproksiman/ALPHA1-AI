@@ -92,7 +92,7 @@ def test_feedback_tracks_latest_meaningful_interaction(brain,registry):
     brain.process('open chrome')
     assert brain.process('that worked')['text']=='Action feedback recorded.'
     assert brain.memory.counts()['knowledge']==0
-    assert brain.memory.db.execute('SELECT count(*) FROM interaction_history').fetchone()[0]==1
+    assert brain.memory.db.execute('SELECT count(*) FROM interaction_history WHERE intent != ?',("conversation",)).fetchone()[0]==1
 
 
 def test_pending_action_cannot_verify_previous_answer(brain,registry):
@@ -522,7 +522,7 @@ def test_migration_is_additive_idempotent_and_retains_legacy_data(tmp_path):
         store=AlphaMemory(path)
         assert store.get_knowledge(1)['response']=='Existing answer preserved.'
         assert store.get_knowledge(1)['verification_status']=='verified'
-        assert store.db.execute('PRAGMA user_version').fetchone()[0]==2
+        assert store.db.execute('PRAGMA user_version').fetchone()[0]==3
         assert store.counts()['knowledge']==1
         store.close()
 

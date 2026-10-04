@@ -7,7 +7,7 @@ from threading import RLock
 
 from core.brain.intent_engine import normalize, knowledge_similarity
 from core.brain.confidence import clamp
-from core.learning.knowledge_extractor import unsafe_to_learn
+from core.learning.knowledge_extractor import unsafe_to_learn, contains_secret
 from memory.config_manager import BASE_DIR
 
 
@@ -90,6 +90,82 @@ class AlphaMemory:
                     ON learned_knowledge(verification_status,confidence);
                 PRAGMA user_version=2;
             ''')
+            history_columns = {r[1] for r in self.db.execute('PRAGMA table_info(interaction_history)')}
+            for name, declaration in {
+                'mode': "TEXT NOT NULL DEFAULT 'offline'", 'topic': "TEXT NOT NULL DEFAULT ''",
+                'project': "TEXT NOT NULL DEFAULT ''", 'importance': 'REAL NOT NULL DEFAULT 0.5',
+                'summary_link': "TEXT NOT NULL DEFAULT 'current'",
+            }.items():
+                if name not in history_columns:
+                    self.db.execute(f'ALTER TABLE interaction_history ADD COLUMN {name} {declaration}')
+            self.db.executescript('''
+                CREATE TABLE IF NOT EXISTS conversation_state (
+                    id INTEGER PRIMARY KEY CHECK(id=1), topic TEXT NOT NULL DEFAULT '',
+                    project TEXT NOT NULL DEFAULT '', next_step TEXT NOT NULL DEFAULT '',
+                    summary TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+                CREATE TABLE IF NOT EXISTS companion_facts (
+                    name TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+                PRAGMA user_version=3;
+            ''')
+
+    def conversation(self, user, answer, mode='offline', topic='', project='', next_step='', importance=.5):
+        values = (user, answer, topic, project, next_step)
+        if mode not in ('live', 'offline') or any(not isinstance(v, str) or len(v)>4000 or contains_secret(v) for v in values):
+            return False
+        if not user.strip() and not answer.strip():
+            return False
+        with self._lock, self.db:
+            self.db.execute('''INSERT INTO interaction_history
+                (user_input,response,source,intent,confidence,mode,topic,project,importance)
+                VALUES (?,?,?,'conversation',0,?,?,?,?)''',
+                (user,answer,mode,mode,topic[:300],project[:300],clamp(importance)))
+            old = self.conversation_state()
+            topic, project, next_step = topic or old.get('topic',''), project or old.get('project',''), next_step or old.get('next_step','')
+            summary = f'Topic: {topic}\nProject: {project}\nNext step: {next_step}'
+            self.db.execute('''INSERT INTO conversation_state(id,topic,project,next_step,summary)
+                VALUES (1,?,?,?,?) ON CONFLICT(id) DO UPDATE SET topic=excluded.topic,
+                project=excluded.project,next_step=excluded.next_step,summary=excluded.summary,
+                updated_at=CURRENT_TIMESTAMP''',(topic,project,next_step,summary))
+        return True
+
+    def conversation_state(self):
+        with self._lock:
+            row = self.db.execute('SELECT * FROM conversation_state WHERE id=1').fetchone()
+        return dict(row) if row else {}
+
+    def recent_conversation(self, limit=6):
+        with self._lock:
+            rows = self.db.execute("SELECT * FROM interaction_history WHERE intent='conversation' ORDER BY id DESC LIMIT ?",
+                                   (max(1,min(limit,20)),)).fetchall()
+        return [dict(r) for r in reversed(rows) if not contains_secret(r['user_input']+'\n'+r['response'])]
+
+    def companion_facts(self):
+        with self._lock:
+            return {r['name']:r['value'] for r in self.db.execute('SELECT * FROM companion_facts')
+                    if not contains_secret(r['name']+' '+r['value'])}
+
+    def set_companion_fact(self, name, value):
+        if name not in ('preferred_name','assistant_name','preferences','active_project','goal','note') or not value or len(value)>500 or contains_secret(value):
+            return False
+        with self._lock, self.db:
+            self.db.execute('''INSERT INTO companion_facts(name,value) VALUES (?,?) ON CONFLICT(name)
+                DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP''',(name,value))
+        return True
+
+    def forget_last_conversation(self):
+        with self._lock, self.db:
+            target=self.db.execute("SELECT id,user_input FROM interaction_history WHERE intent='conversation' AND importance>=0.5 ORDER BY id DESC LIMIT 1").fetchone()
+            if not target:
+                return
+            for name,value in self.companion_facts().items():
+                if value.casefold() in target['user_input'].casefold():
+                    self.db.execute('DELETE FROM companion_facts WHERE name=?',(name,))
+            self.db.execute("DELETE FROM interaction_history WHERE intent='conversation' AND id>=?",(target['id'],))
+            self.db.execute('DELETE FROM conversation_state')
+            row=self.db.execute("SELECT topic,project FROM interaction_history WHERE intent='conversation' AND topic!='' ORDER BY id DESC LIMIT 1").fetchone()
+            if row:
+                self.db.execute('INSERT INTO conversation_state(id,topic,project,summary) VALUES (1,?,?,?)',
+                                (row['topic'],row['project'],'Topic: '+row['topic']))
 
     def close(self):
         with self._lock:
