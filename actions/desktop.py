@@ -81,29 +81,14 @@ def _build_sandbox() -> dict:
 
 
 def _execute_generated_code(code: str, player=None) -> str:
-    if not code or code.strip() == "UNSAFE":
-        return "This action cannot be performed safely."
-
-    # Kod temizleme
-    if code.startswith("```"):
-        lines = code.split("\n")
-        code  = "\n".join(lines[1:-1]).strip()
-
-    sandbox      = _build_sandbox()
-    output_lines = []
-    sandbox["__builtins__"]["print"] = lambda *a: output_lines.append(" ".join(str(x) for x in a))
-
-    try:
-        exec(compile(code, "<jarvis_desktop>", "exec"), sandbox)
-        return "\n".join(output_lines) if output_lines else "Done."
-    except Exception as e:
-        print(f"[Desktop] Exec error: {e}\nCode:\n{code[:300]}")
-        return f"Execution error: {e}"
+    # Legacy sandbox admitted reflection and arbitrary model-authored programs.
+    # Natural-language desktop requests now select the deterministic operations
+    # below instead; generated programs are never an execution interface.
+    return 'Generated code execution is disabled. Choose a registered desktop operation.'
 
 
 def _ask_gemini_for_desktop_action(task: str) -> str:
 
-    from google import genai as _genai
 
     desktop = str(_get_desktop())
 
@@ -464,17 +449,33 @@ def desktop_control(
             if not actual_task:
                 return "Please describe what you want to do on the desktop."
 
-            print(f"[Desktop] Asking Gemini: {actual_task}")
             if player:
-                player.write_log("[Desktop] Generating action...")
-
-            code = _ask_gemini_for_desktop_action(actual_task)
-            return _execute_generated_code(code, player=player)
+                player.write_log('[Desktop] Selecting a registered local operation...')
+            from core.providers.ollama_provider import OllamaProvider
+            from memory.config_manager import get_offline_brain_settings
+            from core.brain.action_planner import validate_args
+            cfg = get_offline_brain_settings()
+            model = OllamaProvider(cfg['ollama_url'], cfg['ollama_model'],
+                                   fast_model=cfg['ollama_fast_model'])
+            try:
+                reply = model.chat([
+                    {'role': 'system', 'content': 'Choose a desktop operation as JSON args only. '
+                     'Use one of wallpaper, wallpaper_url, current_wallpaper, organize, clean, list, stats. '
+                     'Never return code. For unsupported requests return {}. Schema: ' + json.dumps(TOOL['parameters'])},
+                    {'role': 'user', 'content': actual_task}], role='fast', think=False, format='json')
+                chosen = json.loads(reply['text']) if reply.get('ok') else {}
+                validate_args(chosen, TOOL['parameters'])
+                if chosen.get('action') not in {'wallpaper', 'wallpaper_url', 'current_wallpaper', 'organize', 'clean', 'list', 'stats'} or chosen.get('task'):
+                    return 'Please choose wallpaper, organize, clean, list, or desktop stats.'
+                return desktop_control(chosen, player=player)
+            except (ValueError, TypeError):
+                return 'The desktop operation was invalid; nothing was executed.'
+            finally:
+                model.session.close()
 
         else:
             if action:
-                code = _ask_gemini_for_desktop_action(action)
-                return _execute_generated_code(code, player=player)
+                return desktop_control({'action': 'task', 'task': action}, player=player)
             return "No action or task specified."
 
     except Exception as e:

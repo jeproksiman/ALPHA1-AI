@@ -41,7 +41,7 @@ def _gemini_client(tier: str = gemini.SMART):
         def generate_content(self, contents):
             resp = gemini.call(contents, tier=tier, timeout_ms=90000)
             if resp is None:
-                raise RuntimeError("every Gemini model on the ladder failed")
+                raise RuntimeError('The local Ollama model could not complete this request.')
             return resp
 
     return _W()

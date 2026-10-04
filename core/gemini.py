@@ -312,6 +312,9 @@ def api_key(refresh: bool = False) -> str:
 def client(timeout_ms: int = DEFAULT_TIMEOUT_MS, key: str = ""):
     """A configured genai.Client with a deadline on it. Raises if there is no
     key, because a caller that cannot work without one should say so."""
+    from memory.config_manager import get_runtime_settings
+    if not get_runtime_settings()['cloud_ai_enabled']:
+        raise RuntimeError('Cloud AI is disabled. Use the local generation gateway.')
     from google import genai
     from google.genai import types as gtypes
 
@@ -474,6 +477,80 @@ def call(contents, tier: str = FAST, config=None,
     a silent None during a session nobody can debug is how the original problem
     stayed hidden.
     """
+    # Compatibility entry point for existing actions. All generation now uses
+    # the loopback Ollama provider, even if legacy cloud keys remain configured.
+    return _local_call(contents, tier, config, timeout_ms)
+
+
+def _local_call(contents, tier, config, timeout_ms):
+    import base64
+    import io
+    from types import SimpleNamespace
+    from core.providers.ollama_provider import OllamaProvider
+    from memory.config_manager import get_offline_brain_settings
+    from core.learning.knowledge_extractor import contains_secret
+    cfg = get_offline_brain_settings()
+    provider = OllamaProvider(cfg['ollama_url'], cfg['ollama_model'], cfg['ollama_enabled'],
+                              fast_model=cfg['ollama_fast_model'], embedding_model=cfg['embedding_model'])
+    provider.timeout = min(90, max(3, timeout_ms / 1000))
+    def field(obj, name, default=None):
+        return obj.get(name, default) if isinstance(obj, dict) else getattr(obj, name, default)
+    # Grounding belongs to the existing web retrieval action, never model recall.
+    if tier == SEARCH or field(config, 'tools'):
+        return None
+    texts, images = [], []
+    def collect(part):
+        if isinstance(part, str):
+            texts.append(part)
+        elif isinstance(part, (list, tuple)):
+            for item in part:
+                collect(item)
+        elif field(part, 'text'):
+            texts.append(field(part, 'text'))
+        elif field(part, 'parts'):
+            collect(field(part, 'parts'))
+        elif field(part, 'inline_data'):
+            blob = field(part, 'inline_data')
+            if not str(field(blob, 'mime_type', '')).startswith('image/'):
+                raise ValueError('Unsupported local media input')
+            data = field(blob, 'data')
+            if not isinstance(data, bytes) or len(data) > 10_000_000:
+                raise ValueError('Invalid local image')
+            images.append(base64.b64encode(data).decode('ascii'))
+        elif hasattr(part, 'save') and hasattr(part, 'size'):
+            image = part.copy()
+            image.thumbnail((1280, 1280))
+            buf = io.BytesIO()
+            image.convert('RGB').save(buf, format='JPEG')
+            images.append(base64.b64encode(buf.getvalue()).decode('ascii'))
+        else:
+            raise ValueError('Unsupported local input')
+    try:
+        collect(contents)
+        text_input = '\n'.join(texts)
+        if contains_secret(text_input):
+            return None
+        system = field(config, 'system_instruction', '') or ''
+        if not isinstance(system, str):
+            return None
+        message = {'role': 'user', 'content': text_input[:32000]}
+        if images:
+            message['images'] = images[:3]
+        reply = provider.chat([{'role': 'system', 'content': system[:4000] or
+                              'You are JARVIS. Answer using the supplied local data. Never invent current facts.'}, message],
+                              role='primary' if tier != FAST or images else 'fast', think=False)
+        return SimpleNamespace(text=reply['text']) if reply.get('ok') else None
+    except (ValueError, TypeError):
+        return None
+    finally:
+        provider.session.close()
+
+
+def _legacy_cloud_call(contents, tier=FAST, config=None, timeout_ms=DEFAULT_TIMEOUT_MS, key=''):
+    # Explicit legacy helper, never called by the public generation entry point.
+    from memory.config_manager import get_runtime_settings
+    if not get_runtime_settings()['cloud_ai_enabled']:
+        return None
     # `tier` is normally FAST or SMART. Anything else is taken to be an explicit
     # model name — screen_agent lets the user pick one in its settings — and it
     # is tried first, with the reasoning ladder behind it. So a user's choice is

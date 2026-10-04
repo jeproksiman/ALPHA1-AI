@@ -134,51 +134,41 @@ def test_offline_typed_and_explicit_live_prefix_use_local_brain():
     assert app._local_busy == 0
 
 
-@pytest.mark.parametrize('mode,network,attempts', [('auto', True, 1), ('auto', False, 0),
-                                                   ('offline', True, 0), ('live', False, 1)])
-def test_real_run_loop_admission_without_cloud_or_ui_imports(monkeypatch, mode, network, attempts):
-    from core.offline_voice import OfflineVoice
-    settings = lambda: {'mode': mode, 'vosk_model_path': '', 'tts_enabled': False}
+@pytest.mark.parametrize('mode,network', [('auto', True), ('auto', False),
+                                         ('offline', True), ('live', False)])
+def test_normal_run_never_opens_cloud_session(monkeypatch, mode, network):
+    settings = lambda: {'mode': mode, 'tts_enabled': False}
     client = Mock()
-    class StopConnect:
-        async def __aenter__(self):
-            raise asyncio.CancelledError()
-        async def __aexit__(self, *args):
-            pass
-    client.aio.live.connect.return_value = StopConnect()
-    fake_dashboard = SimpleNamespace(DashboardServer=Mock(side_effect=RuntimeError('disabled in test')))
-    monkeypatch.setitem(sys.modules, 'dashboard.server', fake_dashboard)
-    ns = dict(RuntimeMode=RuntimeMode, get_runtime_settings=settings,
-              _get_ai_provider=lambda: 'gemini', _get_api_key=lambda provider: 'dummy',
-              OfflineVoice=OfflineVoice, audio_devices=Mock(), get_input_device=lambda: '',
-              SEND_SAMPLE_RATE=16000, RECEIVE_SAMPLE_RATE=24000, confirm_gate=Mock(),
-              set_trim_notifier=Mock(), _gemini=Mock(), genai=SimpleNamespace(Client=Mock(return_value=client)))
-    app = adapter(['run', '_await_live_admission'], ns)
+    voice = Mock()
+    monkeypatch.setitem(sys.modules, 'dashboard.server', SimpleNamespace(
+        DashboardServer=Mock(side_effect=RuntimeError('disabled in test'))))
+    app = adapter(['run', '_run_local', '_create_local_voice'], dict(get_runtime_settings=settings,
+        OfflineVoice=Mock(return_value=voice), audio_devices=Mock(),
+        get_input_device=lambda: '', SEND_SAMPLE_RATE=16000, RECEIVE_SAMPLE_RATE=24000,
+        confirm_gate=Mock(), set_trim_notifier=Mock(), genai=client))
     app._runtime = RuntimeMode(settings, AsyncMock(return_value=network))
     app.ui = Mock(muted=False)
-    app._local_lock = threading.Lock()
-    app._local_busy = 0
-    app._is_speaking = False
-    app._ptt_enabled = False
-    app._offline_voice = None
-    app.set_speaking = Mock()
-    app._on_offline_text_command = Mock()
-    app._active_provider = 'gemini'
-    app._resume_handle = None
-    app._enhanced_live = False
-    app._build_config = Mock()
-    app._session_log = []
+    app._is_speaking = app._ptt_enabled = False
+    app._offline_brain = Mock()
+    app._visemes = Mock()
+    app._observe_local_audio = Mock()
+    app.set_speaking = app._on_offline_text_command = app._offline_audio_envelope = Mock()
+    app._cancel_local_responses = Mock()
+    async def wait():
+        await asyncio.Event().wait()
+    app._run_sleep_watch = app._local_services = wait
     async def exercise():
         task = asyncio.create_task(app.run())
         await asyncio.sleep(.04)
+        assert app._runtime.offline
+        voice.start.assert_called_once()
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
     run(exercise())
-    assert client.aio.live.connect.call_count == attempts
-    if not attempts:
-        assert app.ui.write_log.call_count == 2  # one mode message, one honest mic status
-        app.ui.set_state.assert_called_with('OFFLINE')
+    voice.close.assert_called_once()
+    app._runtime.probe.assert_not_awaited()
+    client.assert_not_called()
 
 
 def test_ui_existing_face_state_and_backend_startup_gate():
@@ -186,62 +176,14 @@ def test_ui_existing_face_state_and_backend_startup_gate():
     tree = ast.parse(source)
     method = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == '_apply_state')
     assert ast.unparse(method) == "def _apply_state(self, state: str):\n    self.hud.state = state\n    self.hud.speaking = state == 'SPEAKING'"
-    assert "if not self._ready and get_runtime_settings()['mode'] == 'live':" in source
+    assert "self._ready = True" in source
     assert 'a VPN may be required' not in Path('main.py').read_text(encoding='utf-8')
 
 
-def test_active_live_network_loss_closes_session_and_enters_offline(monkeypatch):
-    from core.offline_voice import OfflineVoice
-    settings = lambda: {'mode': 'auto', 'vosk_model_path': '', 'tts_enabled': False}
-    closed = Mock()
-    class Session:
-        async def __aenter__(self):
-            return Mock()
-        async def __aexit__(self, *args):
-            closed()
-    client = Mock()
-    client.aio.live.connect.return_value = Session()
-    monkeypatch.setitem(sys.modules, 'dashboard.server', SimpleNamespace(
-        DashboardServer=Mock(side_effect=RuntimeError('disabled in test'))))
-    ns = dict(get_runtime_settings=settings, OfflineVoice=OfflineVoice,
-        _get_ai_provider=lambda: 'gemini', _get_api_key=lambda provider: 'dummy',
-        audio_devices=Mock(), get_input_device=lambda: '', SEND_SAMPLE_RATE=16000,
-        RECEIVE_SAMPLE_RATE=24000, confirm_gate=Mock(), set_trim_notifier=Mock(),
-        _gemini=Mock(), genai=SimpleNamespace(Client=Mock(return_value=client)),
-        error_kind=error_kind, _is_reconnect_signal=lambda error: False)
-    app = adapter(['run', '_await_live_admission'], ns)
-    app._runtime = RuntimeMode(settings, AsyncMock(return_value=True))
-    app.ui = Mock(muted=False)
-    app._local_lock, app._local_busy = threading.Lock(), 0
-    app._is_speaking = app._ptt_enabled = app._wake_enabled = False
-    app._offline_voice = None
-    app._active_provider = 'gemini'
-    app._resume_handle = None
-    app._enhanced_live = False
-    app._briefing_sent = True
-    app._session_log = []
-    app.set_speaking = app._on_offline_text_command = app._build_config = Mock()
-    async def wait():
-        await asyncio.Event().wait()
-    async def lose_network():
-        raise socket.gaierror(11001, 'getaddrinfo failed')
-    for name in ('_watch_reconnect', '_watch_runtime_mode', '_send_realtime', '_listen_audio',
-                 '_play_audio', '_run_system_monitor', '_run_background_monitor',
-                 '_run_proactive_mode', '_run_sleep_watch'):
-        setattr(app, name, wait)
-    app._receive_audio = lose_network
-    async def exercise():
-        task = asyncio.create_task(app.run())
-        await asyncio.sleep(.04)
-        assert app._runtime.offline and app.session is None
-        assert client.aio.live.connect.call_count == 1
-        assert app._runtime.probe.await_count == 1
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-    run(exercise())
-    closed.assert_called_once()
-    assert not any('retrying' in str(call).lower() for call in app.ui.write_log.call_args_list)
+def test_legacy_cloud_is_disabled_by_default():
+    app = adapter(['_run_legacy_cloud'], {'get_runtime_settings': lambda: {'cloud_ai_enabled': False}})
+    with pytest.raises(RuntimeError, match='Cloud AI is disabled'):
+        run(app._run_legacy_cloud())
 
 
 def test_voice_requires_local_assets_and_never_downloads(monkeypatch):

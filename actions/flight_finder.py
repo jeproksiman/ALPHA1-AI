@@ -148,8 +148,7 @@ def _parse_flights_with_gemini(
     destination: str,
     date:        str,
 ) -> list[dict]:
-    from google import genai as _genai
-    from google.genai import types
+    from core import model_types as types
 
     prompt  = (
         f"Extract flight options from {origin} to {destination} on {date} "

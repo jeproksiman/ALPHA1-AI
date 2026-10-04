@@ -34,7 +34,7 @@ def _get_model(model_name: str = gemini.SMART):
         def generate_content(self, contents):
             resp = gemini.call(contents, tier=model_name, timeout_ms=60000)
             if resp is None:
-                raise RuntimeError("every Gemini model on the ladder failed")
+                raise RuntimeError('The local Ollama model could not complete this request.')
             return resp
 
     return _W()
@@ -227,7 +227,7 @@ Code for {file_path}:"""
         response = model.generate_content(prompt)
         code = _strip_fences(response.text)
 
-        full_path = project_dir / file_path
+        full_path = _project_path(project_dir, file_path)
         full_path.parent.mkdir(parents=True, exist_ok=True)
         full_path.write_text(code, encoding="utf-8")
 
@@ -239,9 +239,18 @@ Code for {file_path}:"""
             raise RateLimitError(str(e))
         raise
 
+def _project_path(project_dir, filename):
+    path = (project_dir / filename).resolve()
+    if not path.is_relative_to(project_dir.resolve()) or path == project_dir.resolve() or '.git' in path.parts:
+        raise ValueError('Generated file path is outside the project.')
+    return path
+
+
 def _install_dependencies(dependencies: list[str], project_dir: Path) -> str:
     if not dependencies:
         return "No external dependencies."
+    if any(not isinstance(dep, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*(?:\[[A-Za-z0-9_,.-]+\])?(?:(?:==|>=|<=|~=|>|<)[A-Za-z0-9.*+-]+)?', dep) for dep in dependencies):
+        return 'Invalid dependency specifications; no installation performed.'
 
     to_install = []
     for dep in dependencies:
@@ -299,8 +308,14 @@ def _run_project(run_command: str, project_dir: Path, timeout: int = 30) -> str:
     print(f"[DevAgent] 🚀 Running: {run_command}")
     try:
         parts = run_command.split()
-        if parts[0].lower() == "python":
-            parts[0] = sys.executable
+        # Model-proposed shell commands are never an execution interface. Only
+        # a saved Python/JavaScript entry inside the confirmed project may run.
+        if len(parts) != 2 or parts[0].lower() not in {'python', 'python3', 'node'}:
+            return 'Unsupported run command. Run the saved project explicitly after reviewing it.'
+        entry = (project_dir / parts[1]).resolve()
+        if not entry.is_relative_to(project_dir.resolve()) or not entry.is_file() or entry.suffix not in {'.py', '.js'}:
+            return 'Invalid project entry point; nothing executed.'
+        parts = [sys.executable if parts[0].lower().startswith('python') else 'node', str(entry)]
 
         result = subprocess.run(
             parts,
@@ -425,7 +440,7 @@ Fixed code for {fix_path}:"""
             response = model.generate_content(prompt)
             fixed = _strip_fences(response.text)
 
-            full_path = project_dir / fix_path
+            full_path = _project_path(project_dir, fix_path)
             full_path.parent.mkdir(parents=True, exist_ok=True)
             full_path.write_text(fixed, encoding="utf-8")
 

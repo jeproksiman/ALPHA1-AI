@@ -167,7 +167,7 @@ def _get_transcript(video_id: str) -> str | None:
 
 
 def _summarize_with_gemini(transcript: str, video_url: str) -> str:
-    from google.genai import types
+    from core import model_types as types
     from core import gemini
 
     max_chars = 80000

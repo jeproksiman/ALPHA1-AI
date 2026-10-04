@@ -83,7 +83,8 @@ class UtteranceSegmenter:
 
 class OfflineVoice:
     def __init__(self, settings, respond, allowed, speaking, log, device=None,
-                 envelope=None, output_device=None, cancel_response=None, speech_text=None, warmup=None):
+                 envelope=None, output_device=None, cancel_response=None, speech_text=None, warmup=None,
+                 audio_observer=None):
         self.settings, self.respond, self.allowed = settings, respond, allowed
         self.speaking, self.log, self.device = speaking, log, device
         self.stop, self.interrupted = threading.Event(), threading.Event()
@@ -94,12 +95,25 @@ class OfflineVoice:
         self.warmup = warmup
         self.warm_cancel = threading.Event()
         self.cancel_response = cancel_response
+        self.audio_observer = audio_observer
+        self.remote_until = 0.0
         self.output = SpeechOutput(settings,speaking,envelope or (lambda pcm,rate:None),log,output_device)
         self.chunks = queue.Queue(maxsize=32)
 
     def start(self):
         self.thread = threading.Thread(target=self._run,daemon=True)
         self.thread.start()
+
+    def submit_remote(self, pcm):
+        """Authenticated dashboard 16 kHz mono PCM, using the same local STT."""
+        if not isinstance(pcm, bytes) or not 0 < len(pcm) <= 32000 or len(pcm) % 2:
+            return
+        self.remote_until = time.monotonic() + .5
+        if self.ready and self.allowed() and not self.active and not self.output.busy:
+            try:
+                self.chunks.put_nowait(pcm)
+            except queue.Full:
+                pass
 
     def close(self):
         self.stop.set()
@@ -134,7 +148,7 @@ class OfflineVoice:
             from core.local_speech import select_speech
             speech = select_speech(self.settings,self.log)
             if speech:
-                self.log('SYS: Local speech ready.')
+                self.log('SYS: [TTS] Local voice ready.')
                 if hasattr(speech,'close'):
                     speech.close()
             if stt is None or self.stop.is_set():
@@ -145,6 +159,10 @@ class OfflineVoice:
             last_active = time.monotonic()
             warmed = False
             def capture(data,frames,timing,status):
+                if time.monotonic() < self.remote_until:
+                    return
+                if self.audio_observer:
+                    self.audio_observer(bytes(data))
                 # Barge-in is opt-in because speaker echo varies by room.
                 if self.output.busy and self.settings.get('barge_in',False):
                     pcm = np.frombuffer(bytes(data),dtype=np.int16).astype(np.float32)/32768

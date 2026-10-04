@@ -74,7 +74,7 @@ class OllamaProvider:
                 'roles':{role:{'model':model,'ready':bool(status['available'] and self._model(role,status))}
                          for role,model in [('primary',self.model),('fast',self.fast_model),('embedding',self.embedding_model)]}}
 
-    def chat(self, messages, role='primary', max_tokens=600, think=None, cancel=None):
+    def chat(self, messages, role='primary', max_tokens=600, think=None, cancel=None, format=None):
         if cancel is not None and cancel.is_set():
             return {'ok':False,'text':'Interrupted.'}
         if role not in ('primary','fast'):
@@ -94,6 +94,9 @@ class OllamaProvider:
                        'options':{'num_predict':max(1,min(max_tokens,600))}}
             if think is not None:
                 payload['think'] = bool(think)
+            if format is not None:
+                payload['format'] = format
+                payload['options']['temperature'] = 0
             kwargs = {'stream':True} if cancel is not None else {}
             response = self.session.post(self.url + '/api/chat',
                 json=payload,
@@ -141,7 +144,7 @@ class OllamaProvider:
             messages.append({'role': 'system', 'content': context['summary'][:2000]})
         messages.append({'role': 'user', 'content': text})
         cancel = context.get('_cancel') if context else None
-        return self.chat(messages,cancel=cancel) if cancel is not None else self.chat(messages)
+        return self.chat(messages, think=False, cancel=cancel) if cancel is not None else self.chat(messages, think=False)
 
     def warmup(self, cancel):
         if cancel.is_set():

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import platform as _platform
 import subprocess as _subprocess
 
@@ -47,8 +49,6 @@ from pathlib import Path
 
 import sounddevice as sd
 import numpy as np
-from google import genai
-from google.genai import types
 from ui import JarvisUI
 from memory.memory_manager import (
     load_memory, update_memory, format_memory_for_prompt,
@@ -552,6 +552,9 @@ def _keep_context_of(exc: BaseException) -> bool:
 class JarvisLive:
     def __init__(self, ui: JarvisUI):
         self._runtime = RuntimeMode(get_runtime_settings)
+        # Normal operation always uses the local brain, independent of legacy
+        # runtime/provider settings or whether old credentials remain on disk.
+        self._runtime.offline = True
         self._local_busy = 0
         self._local_lock = threading.Lock()
         self._request_cancels = set()
@@ -643,6 +646,14 @@ class JarvisLive:
             reserved_names=_inline_names,
             logger=lambda msg: print(f"[Actions] {msg}"),
         )
+        # Inline tools join the same registry for local planning, keeping one
+        # tool inventory and the existing handler/UI implementations.
+        from core.action_loader import ActionRecord
+        for decl in TOOL_DECLARATIONS:
+            name = decl['name']
+            self._action_registry._actions[name] = ActionRecord(
+                name=name, description=decl['description'], parameters=decl['parameters'],
+                handler=lambda parameters, _name=name: self._execute_local_action(_name, parameters), valid=True)
 
         # Plugins must not collide with either an inline tool or a discovered action.
         _core_names = _inline_names | self._action_registry.names()
@@ -671,6 +682,17 @@ class JarvisLive:
                     confirmer=lambda intent, title, run: confirm_gate.request(
                         'alpha_' + intent, title, 'Confirm this locally matched action.', run),
                 )
+                from core.brain.action_planner import ActionPlanner
+                self._offline_brain.action_planner = ActionPlanner(
+                    self._offline_brain.provider, self._action_registry,
+                    plugins=self._plugin_registry,
+                    confirmer=self._confirm_local_plan,
+                    executor=self._execute_local_action,
+                    settings=get_runtime_settings,
+                    context_reader=lambda: {'current_file': self.ui.current_file},
+                    completion=self._local_action_completed)
+                self._offline_brain.register_command('system status',
+                    lambda ctx: self._execute_local_action('system_status', {}), 'system_status')
                 # Availability check runs off the UI thread and never launches Ollama.
                 threading.Thread(target=self._report_offline_brain, daemon=True).start()
             except Exception:
@@ -798,6 +820,10 @@ class JarvisLive:
         exactly like a proactive check-in; Gemini phrases it naturally in the
         user's language. Silently a no-op when no session is connected.
         """
+        if getattr(getattr(self, '_runtime', None), 'offline', False):
+            threading.Thread(target=self._on_offline_text_command,
+                             args=(instruction,), daemon=True).start()
+            return
         loop = getattr(self, "_loop", None)
         if not loop or not self.session:
             return
@@ -840,6 +866,10 @@ class JarvisLive:
         is that it restores the voice with it — which would make the picker
         appear to do nothing. Losing context here is acceptable because changing
         voice is a deliberate, rare act; losing it on a dropped packet was not."""
+        if self._runtime.offline:
+            self.ui.write_log('SYS: Reloading local voice settings. Select the local voice using ALPHA_TTS_VOICE.')
+            self.request_reconnect(keep_context=True, reason='local voice settings')
+            return
         self.request_reconnect(keep_context=False, reason="new voice")
 
     def _on_provider_change(self, provider: str):
@@ -881,6 +911,7 @@ class JarvisLive:
         return url, key, f"{url}/auto-login?key={key}", manual
 
     def _on_offline_text_command(self, text: str, speak_reply=True):
+        import time
         # Respect wake-word sleep: a typed command must not be answered while
         # asleep either (the sleep gate is not just for the mic). Wake first with
         # "Hey Jarvis" or the WAKE NOW button.
@@ -908,6 +939,8 @@ class JarvisLive:
             try:
                 # UI submits this callback on a worker thread. No network/SQLite
                 # work blocks Qt, and no live cloud session is needed for local commands.
+                self.ui.set_state('THINKING')
+                self._last_user_speech = time.monotonic()
                 result = self._offline_brain.process(text, {'_cancel':cancel}) if cancel else self._offline_brain.process(text)
                 if cancel is not None and cancel.is_set():
                     return
@@ -919,6 +952,8 @@ class JarvisLive:
             except Exception:
                 self.ui.write_log('SYS: Offline brain could not complete this request.')
             finally:
+                if hasattr(self, '_speaking_lock'):
+                    self.set_speaking(False)
                 if lock:
                     with lock:
                         self._local_busy -= 1
@@ -1021,6 +1056,8 @@ class JarvisLive:
             pass
 
     def interrupt(self) -> None:
+        from core import confirm
+        confirm.resolve(False)
         """Stop JARVIS mid-speech: drain queued audio and open mic immediately."""
         self._interrupted = True
         self._cancel_local_responses()
@@ -1076,6 +1113,11 @@ class JarvisLive:
                         answer,source='live',intent='companion_dialogue'))
 
     def speak(self, text: str):
+        if self._runtime.offline:
+            self.ui.write_log('ALPHA: ' + ('[Sensitive response withheld]' if contains_secret(text) else text))
+            if self._offline_voice and not contains_secret(text):
+                self._offline_voice.speak(text)
+            return
         if not self._loop or not self.session:
             return
         asyncio.run_coroutine_threadsafe(
@@ -2243,6 +2285,11 @@ class JarvisLive:
                 )
                 if not text:
                     continue
+                if self._runtime.offline:
+                    if self._wake_enabled and not self._awake:
+                        self.wake(reason='remote command')
+                    await asyncio.to_thread(self._on_offline_text_command, text)
+                    continue
                 # Wait up to 8s for session to become ready after a wake
                 for _ in range(80):
                     if self.session:
@@ -2332,6 +2379,150 @@ class JarvisLive:
                 if not await self._runtime.probe(self._active_provider):
                     raise ConnectionError('Internet/live provider unavailable')
 
+    def _execute_local_action(self, name, args, confirmed=False):
+        """Same registered handlers and UI hooks, without a cloud session."""
+        if name == 'system_status':
+            return str(get_system_status())
+        if name == 'close_camera':
+            self.ui.stop_camera_stream()
+            return 'Camera closed.'
+        if name == 'screen_process':
+            from core.model_types import Part
+            camera = args.get('angle') == 'camera'
+            data, mime = _capture_camera() if camera else _capture_screen()
+            if camera:
+                self.ui.start_camera_stream()
+            reply = _gemini.call([Part.from_bytes(data=data, mime_type=mime), args['text']], tier=_gemini.SMART)
+            return reply.text if reply else 'The local vision model could not analyze this image.'
+        if name == 'manage_monitor':
+            action, topic = args.get('action'), args.get('topic', '')
+            if action == 'add' and topic:
+                return add_monitor(topic)
+            if action == 'remove' and topic:
+                return remove_monitor(topic)
+            return str(list_monitors()) if action == 'list' else 'Specify add, remove, or list.'
+        if name == 'save_memory':
+            category, key, value = args.get('category', 'notes'), args.get('key', ''), args.get('value', '')
+            if category not in {'identity', 'preferences', 'projects', 'goals', 'notes', 'relationships', 'wishes'} or not key or not value or contains_secret(value):
+                return 'Memory update rejected.'
+            update_memory({category: {key: {'value': value}}})
+            return 'Remembered locally.'
+        if name == 'shutdown_jarvis':
+            if not confirmed:
+                return 'Confirm before closing JARVIS.'
+            self.ui.request_close()
+            return 'Closing JARVIS.'
+        if self._action_registry.has(name):
+            result = self._action_registry.run(name, args, {
+                'player': self.ui, 'speak': self.speak, 'response': None,
+                'session_memory': None, 'alpha_confirmed': confirmed})
+            if name == 'web_search' and result:
+                self.ui.show_content('SEARCH', result)
+            return result
+        return self._plugin_registry.run(name, args, player=self.ui, session_memory=None)
+
+    def _local_action_completed(self, text, reply, name):
+        if self._offline_brain and not contains_secret(reply):
+            self._offline_brain._finish(text, self._offline_brain.result(
+                reply, intent='action_result', action_name=name))
+            self.speak(reply)
+
+    def _confirm_local_plan(self, name, arguments, run):
+        return confirm_gate.request('ollama_' + name, 'Run ' + name,
+                                    'Review the proposed action parameters:\n' + arguments, run)
+
+    def _create_local_voice(self):
+        return OfflineVoice(
+            get_runtime_settings(), lambda text: self._on_offline_text_command(text, speak_reply=False),
+            lambda: not self.ui.muted and not self._is_speaking and not self._tail_active()
+                    and (not self._wake_enabled or self._awake)
+                    and (not self._ptt_enabled or self._ptt_held),
+            self.set_speaking, self.ui.write_log,
+            device=audio_devices.resolve(get_input_device(), 'input'),
+            output_device=audio_devices.resolve(get_output_device(), 'output'),
+            envelope=self._offline_audio_envelope, speech_text=self._visemes.feed_text,
+            cancel_response=self._cancel_local_responses,
+            warmup=getattr(getattr(self._offline_brain, 'provider', None), 'warmup', None),
+            audio_observer=self._observe_local_audio)
+
+    def _observe_local_audio(self, pcm):
+        if self._wake_enabled and not self._awake and self._wake_detector and not self.ui.muted:
+            self._wake_detector.feed(np.frombuffer(pcm, dtype=np.int16))
+
+    async def _relay_local_phone_audio(self):
+        while True:
+            chunk = await self._dashboard._phone_audio_queue.get()
+            if self._offline_voice and not self.ui.muted:
+                if self._wake_enabled and not self._awake:
+                    self.wake(reason='remote microphone')
+                self._offline_voice.submit_remote(chunk.get('data'))
+
+    async def _run_local(self):
+        """Continuous local interaction; never probes or opens a cloud AI session."""
+        self._runtime.offline = True
+        self._awake = True
+        self.ui.set_state('OFFLINE')
+        self.ui.write_log('SYS: Interactive local-brain mode ready. Ollama handles all reasoning.')
+        self._offline_voice = self._create_local_voice()
+        self._offline_voice.start()
+        if getattr(self, '_wake_enabled', False):
+            await asyncio.to_thread(self._ensure_wake_detector)
+        if hasattr(self, 'set_push_to_talk'):
+            self.set_push_to_talk(get_push_to_talk_enabled())
+        tasks = [asyncio.create_task(self._run_sleep_watch()),
+                 asyncio.create_task(self._local_services())]
+        if self._dashboard:
+            tasks.append(asyncio.create_task(self._relay_local_phone_audio()))
+        try:
+            while True:
+                await self._reconnect_event.wait()
+                self._reconnect_event.clear()
+                # Settings/device changes reuse memory and wait for the current turn.
+                while self._local_busy or self._is_speaking or self._offline_voice.active:
+                    await asyncio.sleep(.1)
+                await asyncio.to_thread(self._offline_voice.close)
+                self._offline_voice = self._create_local_voice()
+                self._offline_voice.start()
+                self.ui.write_log('SYS: Local audio settings applied.')
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            self._cancel_local_responses()
+            await asyncio.to_thread(self._offline_voice.close)
+            self._offline_voice = None
+
+    async def _local_services(self):
+        """Existing system alerts, monitors and opt-in proactive conversation."""
+        tick = 0
+        while True:
+            await asyncio.sleep(10)
+            tick += 1
+            with self._local_lock:
+                idle = self._local_busy == 0 and not self._is_speaking
+            if not self._awake or not idle or time.monotonic() - self._last_user_speech < 30:
+                continue
+            alert = await asyncio.to_thread(self._sys_monitor.check)
+            if alert:
+                self.ui.write_log('SYS: ' + alert)
+                await asyncio.to_thread(self._offline_voice.speak, alert)
+            if tick % 180 == 0 and get_runtime_settings()['web_tools_enabled']:
+                try:
+                    for alert in await asyncio.to_thread(monitor_check_all):
+                        await asyncio.to_thread(self._on_offline_text_command, alert)
+                except Exception:
+                    self.ui.write_log('SYS: Background monitor unavailable; local interaction remains ready.')
+            if tick % 6 == 0 and get_runtime_settings()['proactive_enabled'] and self._proactive.should_trigger(self._last_user_speech):
+                self._proactive.mark_triggered()
+                # Proactive generation has no tool executor: it cannot initiate actions.
+                if self._offline_brain:
+                    reply = await asyncio.to_thread(self._offline_brain.provider.generate,
+                        'Offer one brief useful check-in, without claiming to have performed actions.',
+                        {'summary': self._offline_brain.companion.prompt()})
+                    if reply.get('ok'):
+                        self.ui.write_log('ALPHA: ' + reply['text'])
+                        await asyncio.to_thread(self._offline_voice.speak, reply['text'])
+
     async def run(self):
         self._loop = asyncio.get_event_loop()
         self._reconnect_event = asyncio.Event()
@@ -2368,6 +2559,15 @@ class JarvisLive:
             print(f"[Dashboard] Disabled: {e}")
             self._dashboard = None
 
+        await self._run_local()
+
+    async def _run_legacy_cloud(self):
+        """Retained compatibility code; normal startup never calls this path."""
+        if not get_runtime_settings()['cloud_ai_enabled']:
+            raise RuntimeError('Cloud AI is disabled.')
+        global genai, types
+        from google import genai
+        from google.genai import types
         while True:
             await self._await_live_admission()
             provider = self._active_provider
@@ -2624,8 +2824,6 @@ def main():
 
     def runner():
         jarvis = JarvisLive(ui)
-        if get_runtime_settings()['mode'] == 'live':
-            ui.wait_for_api_key()
         try:
             asyncio.run(jarvis.run())
         except KeyboardInterrupt:

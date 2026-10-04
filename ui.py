@@ -2999,6 +2999,7 @@ class MainWindow(QMainWindow):
     _video_open_sig  = pyqtSignal(str, str, bool, str)  # video, title, muted, audio
     _wake_btns_sig   = pyqtSignal()          # wake state resolved off-thread
     _video_close_sig = pyqtSignal()
+    _quit_sig = pyqtSignal()
     _video_mute_sig  = pyqtSignal(bool)
     _clipboard_sig  = pyqtSignal(str)        # clipboard text changed (thread-safe)
     _confirm_sig    = pyqtSignal(str, str)   # (title, detail) — irreversible-action gate
@@ -3284,6 +3285,7 @@ class MainWindow(QMainWindow):
         self._wake_btns_sig.connect(self._refresh_wake_btns)
         self._video_open_sig.connect(self._on_video_open)
         self._video_close_sig.connect(self._on_video_close)
+        self._quit_sig.connect(self.close)
         self._video_mute_sig.connect(self._on_video_mute)
         self._clipboard_sig.connect(self._show_clipboard_panel)
         self._wake_dl_sig.connect(self._on_wake_install_done)
@@ -3302,9 +3304,9 @@ class MainWindow(QMainWindow):
 
         self._overlay: SetupOverlay | None = None
         self._ready = self._check_config()
-        from memory.config_manager import get_runtime_settings
-        if not self._ready and get_runtime_settings()['mode'] == 'live':
-            self._show_setup()
+        # Local-brain startup needs no cloud credentials. The existing settings
+        # drawer remains available, but never blocks typing or microphone setup.
+        self._ready = True
 
         sc_mute = QShortcut(QKeySequence("F4"), self)
         sc_mute.activated.connect(self._toggle_mute)
@@ -5839,6 +5841,10 @@ class JarvisUI:
     def wait_for_api_key(self):
         while not self._win._ready:
             time.sleep(0.1)
+
+    def request_close(self):
+        """Close on the Qt thread after the existing confirmation gate."""
+        self._win._quit_sig.emit()
 
     def show_content(self, title: str, text: str):
         """Thread-safe: display content in the panel below the HUD."""

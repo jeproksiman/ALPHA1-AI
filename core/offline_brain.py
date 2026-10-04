@@ -56,6 +56,7 @@ class OfflineBrain:
         from core.brain.adaptive_router import AdaptiveRouter
         self.adaptive = AdaptiveRouter(self)
         self.routines = RoutineManager(self.memory, self.adaptive.resolve_command)
+        self.action_planner = None
 
     def register_command(self, phrase, handler, intent='known_command', dangerous=False, **metadata):
         self.commands[normalize(phrase)] = Command(phrase, handler, intent, dangerous, **metadata)
@@ -165,7 +166,8 @@ class OfflineBrain:
             adaptive = self.adaptive.handle(text,include_context=False)
             if adaptive:
                 return self._finish(text,adaptive)
-            local = self.lookup_local(text, context)
+            fresh = self.action_planner and self.action_planner.FRESH.search(text)
+            local = None if fresh else self.lookup_local(text, context)
             if local:
                 return self._finish(text,local)
             fallback_context = dict(context or {})
@@ -176,6 +178,14 @@ class OfflineBrain:
             if relevant:
                 fallback_context['summary']=(fallback_context['summary'][:1400]+'\nRelevant verified knowledge:\n'+
                     '\n'.join(row['trigger_text'][:80]+': '+row['response'][:180] for row in relevant))[:2000]
+        # Registered tool requests must precede semantic answers: past knowledge
+        # is never evidence that a current action was performed.
+        if self.action_planner:
+            planned = self.action_planner.respond(text, fallback_context)
+            if fallback_context.get('_cancel') and fallback_context['_cancel'].is_set():
+                return self.result('Interrupted.',intent='cancelled')
+            if planned is not None:
+                return self._finish(text, self.result(**planned))
         if self.settings.get('semantic_enabled',True) and self.settings.get('embedding_provider','ollama')=='ollama':
             learned = self.semantic.search(text,threshold=self._threshold())
             if fallback_context.get('_cancel') and fallback_context['_cancel'].is_set():
@@ -217,7 +227,7 @@ class OfflineBrain:
     def startup_report(self):
         status = self.provider.model_status()
         counts = self.memory.counts()
-        lines = ['[ALPHA BRAIN] Offline-first ready',
+        lines = ['[ALPHA BRAIN] Ready (Ollama local brain)',
                 f"[MEMORY] {counts['knowledge']} learned items, {counts['aliases']} aliases, {counts['routines']} routines",
                 '[LEARNING] Verified learning enabled']
         for role,label in [('primary','OLLAMA'),('fast','OLLAMA FAST'),('embedding','SEMANTIC MEMORY')]:

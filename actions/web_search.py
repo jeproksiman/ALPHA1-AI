@@ -16,6 +16,9 @@ _quota_lock          = threading.Lock()
 
 
 def _gemini_available() -> bool:
+    from memory.config_manager import get_runtime_settings
+    if not get_runtime_settings()['cloud_ai_enabled']:
+        return False
     with _quota_lock:
         return time.monotonic() >= _quota_blocked_until
 
@@ -205,6 +208,8 @@ def _gemini_headlines(n: int = 5) -> tuple[list[str], str]:
     Optimised for speed: minimal prompt + strict token cap.
     Returns (headline_list, raw_text_for_display).
     """
+    if not _gemini_available():
+        return [], ''
     import re
     from core import gemini
 
@@ -242,6 +247,8 @@ def _gemini_headlines(n: int = 5) -> tuple[list[str], str]:
 
 def _search(query: str) -> str:
     """Default search — Gemini grounded, DDG fallback."""
+    if not _gemini_available():
+        return _format_ddg(query, _ddg_search(query))
     try:
         return _gemini_search(query)
     except Exception as e:
@@ -275,6 +282,8 @@ def _news(query: str) -> str:
     if text and len(text) > 60 and not text.startswith("No news found"):
         return text
 
+    if not _gemini_available():
+        return f'No news found for: {query}'
     text = _run_bounded(
         lambda: _gemini_search(gemini_query), timeout=6.0, label="Gemini news"
     )
@@ -289,6 +298,8 @@ def _research(query: str) -> str:
     Deep dive — asks Gemini for a comprehensive answer with context.
     Falls back to a wider DDG fetch.
     """
+    if not _gemini_available():
+        return _format_ddg(query, _ddg_search(query, max_results=10))
     research_query = (
         f"Comprehensive, detailed explanation of: {query}. "
         "Include background context, key facts, current state, and important nuances."
@@ -303,6 +314,8 @@ def _research(query: str) -> str:
 
 def _price(query: str) -> str:
     """Product price lookup — searches for current market prices."""
+    if not _gemini_available():
+        return _format_ddg(query, _ddg_search(f'{query} price buy', max_results=6))
     price_query = f"current price of {query} — how much does it cost today"
     try:
         return _gemini_search(price_query)
@@ -318,7 +331,8 @@ def _compare(items: list[str], aspect: str) -> str:
         "Give specific facts and data."
     )
     try:
-        return _gemini_search(query)
+        if _gemini_available():
+            return _gemini_search(query)
     except Exception as e:
         _log_gemini_failure("Gemini compare", e)
 

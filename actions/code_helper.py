@@ -33,7 +33,7 @@ def _get_gemini(tier: str = gemini.SMART):
         def generate_content(self, contents):
             resp = gemini.call(contents, tier=tier, timeout_ms=60000)
             if resp is None:
-                raise RuntimeError("every Gemini model on the ladder failed")
+                raise RuntimeError('The local Ollama model could not complete this request.')
             return resp
 
     return _W()
@@ -461,7 +461,7 @@ def _screen_debug_action(description, file_path, player, speak=None) -> str:
             print(f"[Code] ⚠️ Could not read file: {err}")
 
     try:
-        from google.genai import types
+        from core import model_types as types
 
         image_bytes  = screenshot_path.read_bytes()
         image_base64 = _image_to_base64(screenshot_path)
